@@ -30,3 +30,4 @@ uv venv && uv pip install -e .
 ## Current Progress
 
 - [x] Step 1.1: Project skeleton (pyproject.toml, package structure)
+- [x] Step 1.2: Position encodings (1D sinusoidal + 2D sine for images)
