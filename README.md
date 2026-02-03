@@ -31,3 +31,4 @@ uv venv && uv pip install -e .
 
 - [x] Step 1.1: Project skeleton (pyproject.toml, package structure)
 - [x] Step 1.2: Position encodings (1D sinusoidal + 2D sine for images)
+- [x] Step 2.1-2.3: Transformer encoder, decoder, and full DETR-style Transformer
