@@ -33,3 +33,5 @@ uv venv && uv pip install -e .
 - [x] Step 1.2: Position encodings (1D sinusoidal + 2D sine for images)
 - [x] Step 2.1-2.3: Transformer encoder, decoder, and full DETR-style Transformer
 - [x] Step 2.4: Transformer validation experiment
+- [x] Step 3.1: ResNet18 backbone with FrozenBatchNorm2d
+- [x] Step 3.2: Backbone validation experiment
