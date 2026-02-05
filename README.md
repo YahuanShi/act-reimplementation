@@ -35,3 +35,5 @@ uv venv && uv pip install -e .
 - [x] Step 2.4: Transformer validation experiment
 - [x] Step 3.1: ResNet18 backbone with FrozenBatchNorm2d
 - [x] Step 3.2: Backbone validation experiment
+- [x] Step 4.1-5.1: CVAE encoder + DETRVAE full model
+- [x] Step 4.2-5.2: CVAE and model validation experiments
