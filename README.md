@@ -37,3 +37,5 @@ uv venv && uv pip install -e .
 - [x] Step 3.2: Backbone validation experiment
 - [x] Step 4.1-5.1: CVAE encoder + DETRVAE full model
 - [x] Step 4.2-5.2: CVAE and model validation experiments
+- [x] Step 6.1: ACTPolicy (compute_loss + predict_action + optimizer)
+- [x] Step 6.2: Policy validation experiment
