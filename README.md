@@ -39,3 +39,6 @@ uv venv && uv pip install -e .
 - [x] Step 4.2-5.2: CVAE and model validation experiments
 - [x] Step 6.1: ACTPolicy (compute_loss + predict_action + optimizer)
 - [x] Step 6.2: Policy validation experiment
+- [x] Step 7.1: LeRobot dataset adapter
+- [x] Step 7.2: Data normalization (ACTNormalizer)
+- [x] Step 7.3: Dataset validation experiment
