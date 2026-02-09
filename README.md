@@ -44,3 +44,5 @@ uv venv && uv pip install -e .
 - [x] Step 7.3: Dataset validation experiment
 - [x] Step 8.1: Training workspace (training loop + checkpointing)
 - [x] Step 8.2: Training smoke test
+- [x] Step 9.1: Temporal ensembling implementation
+- [x] Step 9.2: Inference pipeline validation
