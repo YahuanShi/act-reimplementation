@@ -46,3 +46,5 @@ uv venv && uv pip install -e .
 - [x] Step 8.2: Training smoke test
 - [x] Step 9.1: Temporal ensembling implementation
 - [x] Step 9.2: Inference pipeline validation
+- [x] Step 10.1: train.py + eval.py entry scripts
+- [x] Step 10.2: End-to-end integration test
