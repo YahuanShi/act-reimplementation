@@ -20,5 +20,3 @@ logs/
 *.swp
 *.swo
 *~
-
-uv.lock
