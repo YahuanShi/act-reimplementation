@@ -1,221 +1,317 @@
 """
 Training workspace for ACT.
 
-This module implements the complete training pipeline for the ACT policy,
-including data loading, optimization, validation, checkpointing, and
-training curve visualization.
-
-Training loop structure (following the original ACT implementation):
+Training loop structure (validate-first, then train each epoch):
   for each epoch:
-    1. Validation pass (eval mode, no gradients)
-    2. Training pass (train mode, gradient updates)
-    3. Log metrics and save checkpoints
-
-Why validate first? This gives a baseline validation loss before any training
-in that epoch, making it easier to track improvement. It also ensures the
-best checkpoint is always evaluated on unseen data before the model has been
-updated.
+    1. Validation pass  → log val loss
+    2. Training pass    → gradient update per batch
+    3. Log metrics, save checkpoints
 
 Checkpointing strategy:
-  - Best checkpoint: saved whenever validation loss hits a new minimum
-  - Periodic checkpoints: saved every N epochs (configurable)
-  - Last checkpoint: saved at the end of training
-  - Normalizer stats: saved alongside checkpoints for inference
+  - policy_best.ckpt    : state_dict only — lowest val loss, inference-compatible
+  - policy_last.ckpt    : state_dict only — final epoch
+  - checkpoint_full.pt  : full state (policy + optimizer + scheduler + epoch/step)
+                           written every save_every epochs, used for --resume
+  - dataset_stats.pkl   : normalizer stats for inference
+  - config.json         : all hyperparameters for reproducibility
 
-Training curves are saved as PNG plots showing loss, L1, and KL over epochs.
+Optional wandb logging:
+  Set use_wandb=True in config and optionally wandb_project / wandb_run_name.
+  Per-step: train/loss, train/l1, train/kl, train/lr, train/grad_norm
+  Per-epoch: val/loss, val/l1, val/kl, epoch/gpu_mem_gb
 """
 
+import glob
+import json
 import os
 import pickle
 from copy import deepcopy
 
-import torch
-import numpy as np
+import matplotlib
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy as np
+import torch
 from tqdm import tqdm
-from torch.utils.data import DataLoader, random_split
 
 from act.policy.act_policy import ACTPolicy
-from act.dataset.normalizer import ACTNormalizer
 
 
 class TrainWorkspace:
     """
     Complete training workspace for ACT.
 
-    Manages the training loop, data loading, optimizer, checkpointing,
-    and metric logging.
-
     Args:
-        config: dict with all training and model hyperparameters.
-            Model config keys: state_dim, action_dim, hidden_dim, dim_feedforward,
+        config: dict with model and training hyperparameters.
+            Model keys: state_dim, action_dim, hidden_dim, dim_feedforward,
                 backbone, lr_backbone, enc_layers, dec_layers, nheads,
                 num_queries, camera_names, lr, kl_weight
-            Training config keys: num_epochs, batch_size, ckpt_dir, seed,
-                val_ratio (default 0.2), save_every (default 100)
+            Training keys: num_epochs, batch_size, ckpt_dir, seed,
+                save_every (default 100), grad_clip (default 1.0),
+                use_wandb (default False), wandb_project (default "ACT"),
+                wandb_run_name (default None), resume (default None),
+                max_keep_ckpts (default 5)
     """
 
     def __init__(self, config):
         self.config = config
-        self.device = torch.device(
-            'cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # Set random seed for reproducibility
-        seed = config.get('seed', 42)
+        seed = config.get("seed", 42)
         torch.manual_seed(seed)
         np.random.seed(seed)
 
-        # Create checkpoint directory
-        self.ckpt_dir = config['ckpt_dir']
+        self.ckpt_dir = config["ckpt_dir"]
         os.makedirs(self.ckpt_dir, exist_ok=True)
 
     def run(self, train_dataloader, val_dataloader, normalizer=None):
         """
         Run the full training loop.
 
-        Args:
-            train_dataloader: DataLoader for training data
-            val_dataloader: DataLoader for validation data
-            normalizer: ACTNormalizer instance (saved with checkpoints)
-
         Returns:
-            best_ckpt_info: (epoch, val_loss, state_dict) of the best checkpoint
+            (best_epoch, best_val_loss, best_state_dict)
         """
         config = self.config
-        num_epochs = config['num_epochs']
-        save_every = config.get('save_every', 100)
+        num_epochs = config["num_epochs"]
+        save_every = config.get("save_every", 100)
+        grad_clip = config.get("grad_clip", 1.0)
+        use_wandb = config.get("use_wandb", False)
+        max_keep_ckpts = config.get("max_keep_ckpts", 5)
 
-        # Build policy and optimizer
+        # ── Save config ──
+        cfg_path = os.path.join(self.ckpt_dir, "config.json")
+        with open(cfg_path, "w") as f:
+            json.dump({k: v for k, v in config.items() if _json_serializable(v)}, f, indent=2)
+
+        # ── Build model ──
         policy = ACTPolicy(config)
         policy.to(self.device)
         optimizer = policy.configure_optimizers()
 
-        # Save normalizer stats for inference
+        total_steps = len(train_dataloader) * num_epochs
+        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=total_steps, eta_min=config.get("lr", 1e-5) / 10
+        )
+
+        # ── Save normalizer ──
         if normalizer is not None:
-            stats_path = os.path.join(self.ckpt_dir, 'dataset_stats.pkl')
-            with open(stats_path, 'wb') as f:
+            stats_path = os.path.join(self.ckpt_dir, "dataset_stats.pkl")
+            with open(stats_path, "wb") as f:
                 pickle.dump(normalizer.state_dict(), f)
 
-        # Training state
-        train_history = []
-        validation_history = []
-        min_val_loss = float('inf')
+        # ── Resume ──
+        start_epoch = 0
+        global_step = 0
+        min_val_loss = float("inf")
         best_ckpt_info = None
 
-        for epoch in tqdm(range(num_epochs), desc='Training'):
+        resume_path = config.get("resume", None)
+        if resume_path and os.path.exists(resume_path):
+            ckpt = torch.load(resume_path, map_location=self.device, weights_only=False)
+            policy.load_state_dict(ckpt["policy_state_dict"])
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            start_epoch = ckpt["epoch"] + 1
+            global_step = ckpt["global_step"]
+            min_val_loss = ckpt.get("best_val_loss", float("inf"))
+            # Fast-forward scheduler to match global_step
+            for _ in range(global_step):
+                lr_scheduler.step()
+            print(f"Resumed from {resume_path} (epoch {start_epoch}, step {global_step})")
+
+        # ── WandB ──
+        if use_wandb:
+            import wandb
+
+            n_params = sum(p.numel() for p in policy.parameters())
+            wandb.init(
+                project=config.get("wandb_project", "ACT"),
+                name=config.get("wandb_run_name", None),
+                config={
+                    **{k: v for k, v in config.items() if _json_serializable(v)},
+                    "n_params": n_params,
+                    "device": str(self.device),
+                },
+                resume="allow",
+            )
+
+        # ── Training history ──
+        train_history = []
+        validation_history = []
+
+        for epoch in tqdm(range(start_epoch, num_epochs), desc="Training"):
             # ── Validation ──
             val_summary = self._validate(policy, val_dataloader)
             validation_history.append(val_summary)
+            epoch_val_loss = val_summary["loss"].item()
 
-            epoch_val_loss = val_summary['loss']
             if epoch_val_loss < min_val_loss:
                 min_val_loss = epoch_val_loss
-                best_ckpt_info = (epoch, min_val_loss,
-                                  deepcopy(policy.state_dict()))
+                best_ckpt_info = (epoch, min_val_loss, deepcopy(policy.state_dict()))
+                best_path = os.path.join(self.ckpt_dir, "policy_best.ckpt")
+                torch.save(best_ckpt_info[2], best_path)
 
             # ── Training ──
-            epoch_train_losses = self._train_epoch(
-                policy, train_dataloader, optimizer)
+            epoch_train_losses, global_step = self._train_epoch(
+                policy, train_dataloader, optimizer, lr_scheduler, grad_clip, global_step, use_wandb
+            )
             train_history.extend(epoch_train_losses)
-
             epoch_train_summary = _compute_dict_mean(epoch_train_losses)
 
-            # ── Logging ──
+            # ── Console log ──
             if epoch % 10 == 0 or epoch == num_epochs - 1:
                 print(f"\nEpoch {epoch}/{num_epochs}")
-                print(f"  Train loss: {epoch_train_summary['loss']:.5f} "
-                      f"(l1: {epoch_train_summary['l1']:.5f}, "
-                      f"kl: {epoch_train_summary['kl']:.5f})")
-                print(f"  Val loss:   {val_summary['loss']:.5f} "
-                      f"(l1: {val_summary['l1']:.5f}, "
-                      f"kl: {val_summary['kl']:.5f})")
+                print(
+                    f"  Train loss: {epoch_train_summary['loss'].item():.5f} "
+                    f"(l1: {epoch_train_summary['l1'].item():.5f}, "
+                    f"kl: {epoch_train_summary['kl'].item():.5f})"
+                )
+                print(
+                    f"  Val loss:   {epoch_val_loss:.5f} "
+                    f"(l1: {val_summary['l1'].item():.5f}, "
+                    f"kl: {val_summary['kl'].item():.5f})"
+                )
+
+            # ── WandB epoch log ──
+            if use_wandb:
+                import wandb
+
+                epoch_log = {
+                    "val/loss": epoch_val_loss,
+                    "val/l1": val_summary["l1"].item(),
+                    "val/kl": val_summary["kl"].item(),
+                    "epoch/epoch": epoch,
+                }
+                if torch.cuda.is_available():
+                    epoch_log["epoch/gpu_mem_gb"] = (
+                        torch.cuda.max_memory_allocated(self.device) / 1e9
+                    )
+                    torch.cuda.reset_peak_memory_stats(self.device)
+                wandb.log(epoch_log, step=global_step)
 
             # ── Periodic checkpoint ──
-            if epoch % save_every == 0 and epoch > 0:
-                ckpt_path = os.path.join(
-                    self.ckpt_dir, f'policy_epoch_{epoch}.ckpt')
-                torch.save(policy.state_dict(), ckpt_path)
-                self._plot_history(train_history, validation_history,
-                                   epoch, num_epochs)
+            if save_every > 0 and epoch % save_every == 0 and epoch > 0:
+                full_path = os.path.join(self.ckpt_dir, f"checkpoint_epoch{epoch}.pt")
+                torch.save(
+                    {
+                        "epoch": epoch,
+                        "global_step": global_step,
+                        "policy_state_dict": policy.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "best_val_loss": min_val_loss,
+                    },
+                    full_path,
+                )
+                # Keep only the last max_keep_ckpts periodic checkpoints
+                if max_keep_ckpts > 0:
+                    all_ckpts = sorted(
+                        glob.glob(os.path.join(self.ckpt_dir, "checkpoint_epoch*.pt"))
+                    )
+                    for old in all_ckpts[:-max_keep_ckpts]:
+                        os.remove(old)
+                self._plot_history(train_history, validation_history, epoch, num_epochs)
 
         # ── Final saves ──
-        # Save last checkpoint
-        last_path = os.path.join(self.ckpt_dir, 'policy_last.ckpt')
+        last_path = os.path.join(self.ckpt_dir, "policy_last.ckpt")
         torch.save(policy.state_dict(), last_path)
 
-        # Save best checkpoint
-        if best_ckpt_info is not None:
-            best_epoch, min_val_loss, best_state = best_ckpt_info
-            best_path = os.path.join(self.ckpt_dir, 'policy_best.ckpt')
-            torch.save(best_state, best_path)
-            print(f"\nBest checkpoint: epoch {best_epoch}, "
-                  f"val loss {min_val_loss:.6f}")
+        # Full checkpoint for potential resume
+        torch.save(
+            {
+                "epoch": num_epochs - 1,
+                "global_step": global_step,
+                "policy_state_dict": policy.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "best_val_loss": min_val_loss,
+            },
+            os.path.join(self.ckpt_dir, "checkpoint_full.pt"),
+        )
 
-        # Save training curves
-        self._plot_history(train_history, validation_history,
-                           num_epochs, num_epochs)
+        if best_ckpt_info is not None:
+            best_epoch, best_loss, _ = best_ckpt_info
+            print(f"\nBest checkpoint: epoch {best_epoch}, val loss {best_loss:.6f}")
+
+        self._plot_history(train_history, validation_history, num_epochs, num_epochs)
+
+        # ── WandB finish ──
+        if use_wandb:
+            import wandb
+
+            artifact = wandb.Artifact("act-policy", type="model")
+            artifact.add_file(os.path.join(self.ckpt_dir, "policy_best.ckpt"))
+            wandb.log_artifact(artifact)
+            wandb.finish()
 
         return best_ckpt_info
 
-    def _train_epoch(self, policy, dataloader, optimizer):
-        """Run one training epoch, return per-batch loss dicts."""
+    def _train_epoch(
+        self, policy, dataloader, optimizer, lr_scheduler, grad_clip, global_step, use_wandb
+    ):
+        """One training epoch; returns (loss_dicts, updated_global_step)."""
         policy.train()
         epoch_losses = []
 
         for batch in dataloader:
-            qpos = batch['qpos'].to(self.device)
-            image = batch['image'].to(self.device)
-            actions = batch['action'].to(self.device)
-            is_pad = batch['is_pad'].to(self.device)
+            qpos = batch["qpos"].to(self.device)
+            image = batch["image"].to(self.device)
+            actions = batch["action"].to(self.device)
+            is_pad = batch["is_pad"].to(self.device)
 
-            # Forward + backward
             loss_dict = policy.compute_loss(qpos, image, actions, is_pad)
-            loss = loss_dict['loss']
+            loss = loss_dict["loss"]
 
             optimizer.zero_grad()
             loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), grad_clip)
             optimizer.step()
+            lr_scheduler.step()
 
-            epoch_losses.append(_detach_dict(loss_dict))
+            detached = _detach_dict(loss_dict)
+            epoch_losses.append(detached)
+            global_step += 1
 
-        return epoch_losses
+            if use_wandb:
+                import wandb
+
+                wandb.log(
+                    {
+                        "train/loss": detached["loss"].item(),
+                        "train/l1": detached["l1"].item(),
+                        "train/kl": detached["kl"].item(),
+                        "train/lr": optimizer.param_groups[0]["lr"],
+                        "train/grad_norm": grad_norm.item(),
+                    },
+                    step=global_step,
+                )
+
+        return epoch_losses, global_step
 
     def _validate(self, policy, dataloader):
-        """Run validation, return averaged loss dict."""
         policy.eval()
         epoch_dicts = []
-
         with torch.inference_mode():
             for batch in dataloader:
-                qpos = batch['qpos'].to(self.device)
-                image = batch['image'].to(self.device)
-                actions = batch['action'].to(self.device)
-                is_pad = batch['is_pad'].to(self.device)
-
+                qpos = batch["qpos"].to(self.device)
+                image = batch["image"].to(self.device)
+                actions = batch["action"].to(self.device)
+                is_pad = batch["is_pad"].to(self.device)
                 loss_dict = policy.compute_loss(qpos, image, actions, is_pad)
                 epoch_dicts.append(_detach_dict(loss_dict))
-
         return _compute_dict_mean(epoch_dicts)
 
-    def _plot_history(self, train_history, validation_history,
-                      current_epoch, total_epochs):
-        """Save training curve plots to the checkpoint directory."""
+    def _plot_history(self, train_history, validation_history, current_epoch, total_epochs):
         if not train_history:
             return
-
         for key in train_history[0]:
-            plot_path = os.path.join(self.ckpt_dir, f'train_val_{key}.png')
-            plt.figure()
-
+            plot_path = os.path.join(self.ckpt_dir, f"train_val_{key}.png")
             train_values = [d[key].item() for d in train_history]
             val_values = [d[key].item() for d in validation_history]
-
             train_x = np.linspace(0, current_epoch, len(train_values))
             val_x = np.linspace(0, current_epoch, len(val_values))
-
-            plt.plot(train_x, train_values, label='train', alpha=0.7)
-            plt.plot(val_x, val_values, label='validation', alpha=0.7)
-            plt.xlabel('Epoch')
+            plt.figure()
+            plt.plot(train_x, train_values, label="train", alpha=0.7)
+            plt.plot(val_x, val_values, label="validation", alpha=0.7)
+            plt.xlabel("Epoch")
             plt.ylabel(key)
             plt.title(key)
             plt.legend()
@@ -225,7 +321,6 @@ class TrainWorkspace:
 
 
 def _compute_dict_mean(dicts):
-    """Average a list of dicts with tensor values."""
     result = {}
     for k in dicts[0]:
         result[k] = sum(d[k] for d in dicts) / len(dicts)
@@ -233,5 +328,8 @@ def _compute_dict_mean(dicts):
 
 
 def _detach_dict(d):
-    """Detach all tensor values in a dict."""
     return {k: v.detach() for k, v in d.items()}
+
+
+def _json_serializable(v):
+    return isinstance(v, (int, float, str, bool, list, type(None)))
