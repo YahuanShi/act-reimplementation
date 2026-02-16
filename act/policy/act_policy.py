@@ -32,8 +32,8 @@ Optimizer notes:
 
 import torch
 import torch.nn as nn
-from torch.nn import functional as F
 import torchvision.transforms as transforms
+from torch.nn import functional as F
 
 from act.model.detr_vae import build_act_model, kl_divergence
 
@@ -60,15 +60,13 @@ class ACTPolicy(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.model = build_act_model(config)
-        self.kl_weight = config['kl_weight']
+        self.kl_weight = config["kl_weight"]
         self.config = config
 
         # ImageNet normalization — applied to images before feeding into ResNet.
         # The ResNet backbone was pretrained on ImageNet-normalized images, so
         # we must apply the same normalization at both training and inference.
-        self.normalize = transforms.Normalize(
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225])
+        self.normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 
     def compute_loss(self, qpos, image, actions, is_pad):
         """
@@ -87,16 +85,15 @@ class ACTPolicy(nn.Module):
         image = self._normalize_images(image)
 
         # Truncate actions to the model's chunk size
-        actions = actions[:, :self.model.num_queries]
-        is_pad = is_pad[:, :self.model.num_queries]
+        actions = actions[:, : self.model.num_queries]
+        is_pad = is_pad[:, : self.model.num_queries]
 
         # Forward pass through DETRVAE
-        a_hat, is_pad_hat, (mu, logvar) = self.model(
-            qpos, image, None, actions, is_pad)
+        a_hat, is_pad_hat, (mu, logvar) = self.model(qpos, image, None, actions, is_pad)
 
         # L1 reconstruction loss, masked to ignore padded positions
         # all_l1 shape: (bs, chunk_size, action_dim)
-        all_l1 = F.l1_loss(actions, a_hat, reduction='none')
+        all_l1 = F.l1_loss(actions, a_hat, reduction="none")
         # Expand is_pad from (bs, chunk_size) to (bs, chunk_size, 1) for broadcasting
         l1 = (all_l1 * ~is_pad.unsqueeze(-1)).mean()
 
@@ -104,9 +101,9 @@ class ACTPolicy(nn.Module):
         total_kld, dim_wise_kld, mean_kld = kl_divergence(mu, logvar)
 
         loss_dict = {
-            'l1': l1,
-            'kl': total_kld[0],
-            'loss': l1 + self.kl_weight * total_kld[0],
+            "l1": l1,
+            "kl": total_kld[0],
+            "loss": l1 + self.kl_weight * total_kld[0],
         }
         return loss_dict
 
@@ -141,9 +138,9 @@ class ACTPolicy(nn.Module):
         Returns:
             AdamW optimizer
         """
-        lr = self.config['lr']
-        lr_backbone = self.config['lr_backbone']
-        weight_decay = self.config.get('weight_decay', 1e-4)
+        lr = self.config["lr"]
+        lr_backbone = self.config["lr_backbone"]
+        weight_decay = self.config.get("weight_decay", 1e-4)
 
         # Separate backbone parameters from the rest
         backbone_params = []
@@ -151,7 +148,7 @@ class ACTPolicy(nn.Module):
         for name, param in self.model.named_parameters():
             if not param.requires_grad:
                 continue
-            if 'backbones' in name:
+            if "backbones" in name:
                 backbone_params.append(param)
             else:
                 other_params.append(param)
@@ -161,8 +158,7 @@ class ACTPolicy(nn.Module):
             {"params": backbone_params, "lr": lr_backbone},
         ]
 
-        optimizer = torch.optim.AdamW(
-            param_groups, lr=lr, weight_decay=weight_decay)
+        optimizer = torch.optim.AdamW(param_groups, lr=lr, weight_decay=weight_decay)
         return optimizer
 
     def _normalize_images(self, image):
@@ -175,9 +171,8 @@ class ACTPolicy(nn.Module):
         Returns:
             normalized image tensor with same shape
         """
-        bs, num_cam = image.shape[:2]
-        # Reshape to (bs*num_cam, 3, H, W) for torchvision normalize
-        image = image.view(-1, *image.shape[2:])
-        image = torch.stack([self.normalize(img) for img in image])
-        image = image.view(bs, num_cam, *image.shape[1:])
-        return image
+        bs, num_cam, C, H, W = image.shape
+        # Merge batch and camera dims, apply normalize once, restore shape.
+        # transforms.Normalize operates channel-wise on (..., C, H, W) tensors.
+        image = self.normalize(image.view(bs * num_cam, C, H, W))
+        return image.view(bs, num_cam, C, H, W)

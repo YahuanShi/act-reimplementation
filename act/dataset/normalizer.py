@@ -19,8 +19,8 @@ The normalizer statistics are saved alongside the model checkpoint so that
 inference uses the exact same normalization as training.
 """
 
-import torch
 import numpy as np
+import torch
 
 
 class ACTNormalizer:
@@ -45,7 +45,7 @@ class ACTNormalizer:
         self.qpos_std = None
         self._fitted = False
 
-    def fit(self, dataset, action_key='action', state_key='observation.state'):
+    def fit(self, dataset, action_key="action", state_key="observation.state"):
         """
         Compute normalization statistics from a LeRobot dataset.
 
@@ -59,13 +59,9 @@ class ACTNormalizer:
             state_key: key for robot state in the dataset
         """
         hf = dataset.hf_dataset
-        n = len(hf)
 
-        # Collect all actions
-        all_actions = []
-        for i in range(n):
-            all_actions.append(torch.tensor(hf[i][action_key]))
-        all_actions = torch.stack(all_actions)  # (N, action_dim)
+        # Batch column access — much faster than row-by-row hf[i][key]
+        all_actions = torch.tensor(np.array(hf[action_key]), dtype=torch.float32)
 
         self.action_mean = all_actions.mean(dim=0)
         self.action_std = all_actions.std(dim=0)
@@ -75,10 +71,7 @@ class ACTNormalizer:
 
         # Collect all states
         if state_key in hf.features:
-            all_states = []
-            for i in range(n):
-                all_states.append(torch.tensor(hf[i][state_key]))
-            all_states = torch.stack(all_states)
+            all_states = torch.tensor(np.array(hf[state_key]), dtype=torch.float32)
 
             self.qpos_mean = all_states.mean(dim=0)
             self.qpos_std = all_states.std(dim=0)
@@ -138,17 +131,17 @@ class ACTNormalizer:
     def state_dict(self):
         """Serialize normalizer statistics for saving alongside checkpoints."""
         return {
-            'action_mean': self.action_mean,
-            'action_std': self.action_std,
-            'qpos_mean': self.qpos_mean,
-            'qpos_std': self.qpos_std,
-            'fitted': self._fitted,
+            "action_mean": self.action_mean,
+            "action_std": self.action_std,
+            "qpos_mean": self.qpos_mean,
+            "qpos_std": self.qpos_std,
+            "fitted": self._fitted,
         }
 
     def load_state_dict(self, state_dict):
         """Load normalizer statistics from a saved state dict."""
-        self.action_mean = state_dict['action_mean']
-        self.action_std = state_dict['action_std']
-        self.qpos_mean = state_dict['qpos_mean']
-        self.qpos_std = state_dict['qpos_std']
-        self._fitted = state_dict['fitted']
+        self.action_mean = state_dict["action_mean"]
+        self.action_std = state_dict["action_std"]
+        self.qpos_mean = state_dict["qpos_mean"]
+        self.qpos_std = state_dict["qpos_std"]
+        self._fitted = state_dict["fitted"]

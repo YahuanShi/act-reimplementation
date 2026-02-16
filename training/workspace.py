@@ -95,6 +95,7 @@ class TrainWorkspace:
         )
 
         # ── Save normalizer ──
+        self.normalizer = normalizer  # used in _train_epoch and _validate
         if normalizer is not None:
             stats_path = os.path.join(self.ckpt_dir, "dataset_stats.pkl")
             with open(stats_path, "wb") as f:
@@ -257,6 +258,10 @@ class TrainWorkspace:
             actions = batch["action"].to(self.device)
             is_pad = batch["is_pad"].to(self.device)
 
+            if self.normalizer is not None:
+                qpos = self.normalizer.normalize_qpos(qpos)
+                actions = self.normalizer.normalize_action(actions)
+
             loss_dict = policy.compute_loss(qpos, image, actions, is_pad)
             loss = loss_dict["loss"]
 
@@ -295,6 +300,11 @@ class TrainWorkspace:
                 image = batch["image"].to(self.device)
                 actions = batch["action"].to(self.device)
                 is_pad = batch["is_pad"].to(self.device)
+
+                if self.normalizer is not None:
+                    qpos = self.normalizer.normalize_qpos(qpos)
+                    actions = self.normalizer.normalize_action(actions)
+
                 loss_dict = policy.compute_loss(qpos, image, actions, is_pad)
                 epoch_dicts.append(_detach_dict(loss_dict))
         return _compute_dict_mean(epoch_dicts)

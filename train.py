@@ -95,6 +95,9 @@ def main(args):
         "enc_layers": args.enc_layers,
         "dec_layers": args.dec_layers,
         "nheads": args.nheads,
+        "latent_dim": args.latent_dim,
+        "dropout": args.dropout,
+        "pre_norm": args.pre_norm,
         "num_queries": args.chunk_size,
         "camera_names": dataset.image_keys,
         "kl_weight": args.kl_weight,
@@ -144,6 +147,9 @@ if __name__ == "__main__":
     parser.add_argument("--enc_layers", type=int, default=4)
     parser.add_argument("--dec_layers", type=int, default=7)
     parser.add_argument("--nheads", type=int, default=8)
+    parser.add_argument("--latent_dim", type=int, default=32, help="CVAE latent dimension")
+    parser.add_argument("--dropout", type=float, default=0.1, help="Transformer dropout rate")
+    parser.add_argument("--pre_norm", action="store_true", help="Use pre-norm in transformer")
 
     # Training hyperparameters
     parser.add_argument("--epochs", type=int, default=2000)
