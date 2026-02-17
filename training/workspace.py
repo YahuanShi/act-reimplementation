@@ -4,20 +4,22 @@ Training workspace for ACT.
 Training loop structure (validate-first, then train each epoch):
   for each epoch:
     1. Validation pass  → log val loss
-    2. Training pass    → gradient update per batch
+    2. Training pass    → gradient update per batch + EMA step
     3. Log metrics, save checkpoints
 
 Checkpointing strategy:
-  - policy_best.ckpt    : state_dict only — lowest val loss, inference-compatible
-  - policy_last.ckpt    : state_dict only — final epoch
-  - checkpoint_full.pt  : full state (policy + optimizer + scheduler + epoch/step)
+  - policy_best.ckpt    : EMA weights at lowest val loss — use for inference
+  - policy_last.ckpt    : EMA weights at final epoch
+  - checkpoint_full.pt  : full state (policy + EMA + optimizer + epoch/step)
                            written every save_every epochs, used for --resume
+  - checkpoint_stepN.pt : step-level full checkpoint every save_every_steps steps
+                           keeps last max_keep_ckpts, for crash recovery
   - dataset_stats.pkl   : normalizer stats for inference
   - config.json         : all hyperparameters for reproducibility
 
 Optional wandb logging:
   Set use_wandb=True in config and optionally wandb_project / wandb_run_name.
-  Per-step: train/loss, train/l1, train/kl, train/lr, train/grad_norm
+  Per-step: train/loss, train/l1, train/kl, train/lr, train/grad_norm, train/ema_decay
   Per-epoch: val/loss, val/l1, val/kl, epoch/gpu_mem_gb
 """
 
@@ -35,6 +37,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
+from act.model.ema import EMAModel
 from act.policy.act_policy import ACTPolicy
 
 
@@ -75,9 +78,11 @@ class TrainWorkspace:
         config = self.config
         num_epochs = config["num_epochs"]
         save_every = config.get("save_every", 100)
+        save_every_steps = config.get("save_every_steps", 0)
         grad_clip = config.get("grad_clip", 1.0)
         use_wandb = config.get("use_wandb", False)
         max_keep_ckpts = config.get("max_keep_ckpts", 5)
+        use_ema = config.get("use_ema", True)
 
         # ── Save config ──
         cfg_path = os.path.join(self.ckpt_dir, "config.json")
@@ -93,6 +98,9 @@ class TrainWorkspace:
         lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=total_steps, eta_min=config.get("lr", 1e-5) / 10
         )
+
+        # ── EMA ──
+        ema = EMAModel(policy) if use_ema else None
 
         # ── Save normalizer ──
         self.normalizer = normalizer  # used in _train_epoch and _validate
@@ -112,6 +120,8 @@ class TrainWorkspace:
             ckpt = torch.load(resume_path, map_location=self.device, weights_only=False)
             policy.load_state_dict(ckpt["policy_state_dict"])
             optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            if ema is not None and "ema_state_dict" in ckpt:
+                ema.load_state_dict(ckpt["ema_state_dict"])
             start_epoch = ckpt["epoch"] + 1
             global_step = ckpt["global_step"]
             min_val_loss = ckpt.get("best_val_loss", float("inf"))
@@ -148,13 +158,26 @@ class TrainWorkspace:
 
             if epoch_val_loss < min_val_loss:
                 min_val_loss = epoch_val_loss
-                best_ckpt_info = (epoch, min_val_loss, deepcopy(policy.state_dict()))
+                # Save EMA weights as best checkpoint (used for inference)
+                best_weights = (
+                    ema.averaged_model.state_dict() if ema is not None else policy.state_dict()
+                )
+                best_ckpt_info = (epoch, min_val_loss, deepcopy(best_weights))
                 best_path = os.path.join(self.ckpt_dir, "policy_best.ckpt")
                 torch.save(best_ckpt_info[2], best_path)
 
             # ── Training ──
             epoch_train_losses, global_step = self._train_epoch(
-                policy, train_dataloader, optimizer, lr_scheduler, grad_clip, global_step, use_wandb
+                policy,
+                train_dataloader,
+                optimizer,
+                lr_scheduler,
+                grad_clip,
+                global_step,
+                use_wandb,
+                ema,
+                save_every_steps,
+                max_keep_ckpts,
             )
             train_history.extend(epoch_train_losses)
             epoch_train_summary = _compute_dict_mean(epoch_train_losses)
@@ -182,6 +205,7 @@ class TrainWorkspace:
                     "val/l1": val_summary["l1"].item(),
                     "val/kl": val_summary["kl"].item(),
                     "epoch/epoch": epoch,
+                    "epoch/ema_decay": ema.decay if ema is not None else 0.0,
                 }
                 if torch.cuda.is_available():
                     epoch_log["epoch/gpu_mem_gb"] = (
@@ -193,16 +217,16 @@ class TrainWorkspace:
             # ── Periodic checkpoint ──
             if save_every > 0 and epoch % save_every == 0 and epoch > 0:
                 full_path = os.path.join(self.ckpt_dir, f"checkpoint_epoch{epoch}.pt")
-                torch.save(
-                    {
-                        "epoch": epoch,
-                        "global_step": global_step,
-                        "policy_state_dict": policy.state_dict(),
-                        "optimizer_state_dict": optimizer.state_dict(),
-                        "best_val_loss": min_val_loss,
-                    },
-                    full_path,
-                )
+                ckpt_data = {
+                    "epoch": epoch,
+                    "global_step": global_step,
+                    "policy_state_dict": policy.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "best_val_loss": min_val_loss,
+                }
+                if ema is not None:
+                    ckpt_data["ema_state_dict"] = ema.state_dict()
+                torch.save(ckpt_data, full_path)
                 # Keep only the last max_keep_ckpts periodic checkpoints
                 if max_keep_ckpts > 0:
                     all_ckpts = sorted(
@@ -213,20 +237,24 @@ class TrainWorkspace:
                 self._plot_history(train_history, validation_history, epoch, num_epochs)
 
         # ── Final saves ──
+        # Copy EMA weights into policy before saving last checkpoint
+        if ema is not None:
+            ema.copy_to(policy)
+
         last_path = os.path.join(self.ckpt_dir, "policy_last.ckpt")
         torch.save(policy.state_dict(), last_path)
 
         # Full checkpoint for potential resume
-        torch.save(
-            {
-                "epoch": num_epochs - 1,
-                "global_step": global_step,
-                "policy_state_dict": policy.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "best_val_loss": min_val_loss,
-            },
-            os.path.join(self.ckpt_dir, "checkpoint_full.pt"),
-        )
+        full_ckpt = {
+            "epoch": num_epochs - 1,
+            "global_step": global_step,
+            "policy_state_dict": policy.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "best_val_loss": min_val_loss,
+        }
+        if ema is not None:
+            full_ckpt["ema_state_dict"] = ema.state_dict()
+        torch.save(full_ckpt, os.path.join(self.ckpt_dir, "checkpoint_full.pt"))
 
         if best_ckpt_info is not None:
             best_epoch, best_loss, _ = best_ckpt_info
@@ -246,7 +274,17 @@ class TrainWorkspace:
         return best_ckpt_info
 
     def _train_epoch(
-        self, policy, dataloader, optimizer, lr_scheduler, grad_clip, global_step, use_wandb
+        self,
+        policy,
+        dataloader,
+        optimizer,
+        lr_scheduler,
+        grad_clip,
+        global_step,
+        use_wandb,
+        ema=None,
+        save_every_steps=0,
+        max_keep_ckpts=5,
     ):
         """One training epoch; returns (loss_dicts, updated_global_step)."""
         policy.train()
@@ -271,6 +309,9 @@ class TrainWorkspace:
             optimizer.step()
             lr_scheduler.step()
 
+            if ema is not None:
+                ema.step(policy)
+
             detached = _detach_dict(loss_dict)
             epoch_losses.append(detached)
             global_step += 1
@@ -285,9 +326,28 @@ class TrainWorkspace:
                         "train/kl": detached["kl"].item(),
                         "train/lr": optimizer.param_groups[0]["lr"],
                         "train/grad_norm": grad_norm.item(),
+                        "train/ema_decay": ema.decay if ema is not None else 0.0,
                     },
                     step=global_step,
                 )
+
+            # ── Step-level checkpoint (crash recovery) ──
+            if save_every_steps > 0 and global_step % save_every_steps == 0:
+                step_path = os.path.join(self.ckpt_dir, f"checkpoint_step{global_step}.pt")
+                step_ckpt = {
+                    "global_step": global_step,
+                    "policy_state_dict": policy.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                }
+                if ema is not None:
+                    step_ckpt["ema_state_dict"] = ema.state_dict()
+                torch.save(step_ckpt, step_path)
+                if max_keep_ckpts > 0:
+                    step_ckpts = sorted(
+                        glob.glob(os.path.join(self.ckpt_dir, "checkpoint_step*.pt"))
+                    )
+                    for old in step_ckpts[:-max_keep_ckpts]:
+                        os.remove(old)
 
         return epoch_losses, global_step
 

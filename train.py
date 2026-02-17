@@ -108,8 +108,10 @@ def main(args):
         "ckpt_dir": args.ckpt_dir,
         "seed": args.seed,
         "save_every": args.save_every,
+        "save_every_steps": args.save_every_steps,
         "grad_clip": args.grad_clip,
         "max_keep_ckpts": args.max_keep_ckpts,
+        "use_ema": args.use_ema,
         # Resume
         "resume": args.resume,
         # WandB
@@ -160,11 +162,24 @@ if __name__ == "__main__":
     parser.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping max norm")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument(
+        "--use_ema",
+        action="store_true",
+        default=True,
+        help="Enable EMA of model weights for inference (default: on)",
+    )
+    parser.add_argument("--no_ema", dest="use_ema", action="store_false", help="Disable EMA")
 
     # Checkpointing
     parser.add_argument("--ckpt_dir", type=str, default="checkpoints")
     parser.add_argument(
         "--save_every", type=int, default=100, help="Save full checkpoint every N epochs"
+    )
+    parser.add_argument(
+        "--save_every_steps",
+        type=int,
+        default=0,
+        help="Save step-level checkpoint every N steps for crash recovery (0 = disabled)",
     )
     parser.add_argument(
         "--max_keep_ckpts",
