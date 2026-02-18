@@ -21,6 +21,15 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 
 def plot_action_distributions(actions: torch.Tensor, output_dir: str):
+    """Plot per-dimension action histograms.
+
+    Why this matters for ACT training:
+    - Reveals the range of each joint/action dimension before normalization.
+    - A very skewed distribution (e.g., most values clustered near 0 with rare
+      large values) may cause the mean/std normalizer to produce poor scaling.
+      In that case, consider limits-based (min-max) normalization instead.
+    - Red dashed line shows the mean — far from the histogram centre indicates skew.
+    """
     actions_np = actions.numpy()
     n_dims = actions_np.shape[1]
     cols = min(4, n_dims)
@@ -35,8 +44,11 @@ def plot_action_distributions(actions: torch.Tensor, output_dir: str):
         axes[i].set_xlabel("value")
         axes[i].set_ylabel("count")
         axes[i].axvline(
-            actions_np[:, i].mean(), color="red",
-            linestyle="--", linewidth=1, label=f"mean={actions_np[:, i].mean():.2f}",
+            actions_np[:, i].mean(),
+            color="red",
+            linestyle="--",
+            linewidth=1,
+            label=f"mean={actions_np[:, i].mean():.2f}",
         )
         axes[i].legend(fontsize=8)
 
@@ -52,6 +64,18 @@ def plot_action_distributions(actions: torch.Tensor, output_dir: str):
 
 
 def plot_episode_lengths(ds: LeRobotDataset, output_dir: str):
+    """Plot the distribution of episode lengths (in frames).
+
+    LeRobot stores a flat list of frames for all episodes. episode_data_index
+    holds the [from, to) frame indices for each episode — this is how the dataset
+    knows which frames belong to which episode without storing episode IDs per frame.
+
+    Why this matters:
+    - High variance in episode length affects chunk boundary handling (shorter
+      episodes may produce many padded chunks if chunk_size >= episode length).
+    - Very short episodes (<< chunk_size) are wasted data because the action
+      chunk extends past the episode end and must be padded with is_pad=True.
+    """
     lengths = [
         ds.episode_data_index["to"][i].item() - ds.episode_data_index["from"][i].item()
         for i in range(ds.num_episodes)
@@ -74,11 +98,19 @@ def plot_episode_lengths(ds: LeRobotDataset, output_dir: str):
 
 
 def plot_sample_trajectory(ds: LeRobotDataset, action_key: str, output_dir: str):
+    """Plot the action trajectory of the first episode.
+
+    Useful for:
+    - Checking that data loading produced sensible values (not all zeros, not NaN).
+    - Seeing which dimensions are active vs. constant (constant dims waste model
+      capacity and may need to be removed from action_dim).
+    - Understanding the temporal structure: periodic motion, ramp-up/down, etc.
+    """
     ep_start = ds.episode_data_index["from"][0].item()
     ep_end = ds.episode_data_index["to"][0].item()
-    actions = torch.stack([
-        torch.tensor(ds.hf_dataset[i][action_key]) for i in range(ep_start, ep_end)
-    ])
+    actions = torch.stack(
+        [torch.tensor(ds.hf_dataset[i][action_key]) for i in range(ep_start, ep_end)]
+    )
     actions_np = actions.numpy()
     T, n_dims = actions_np.shape
 
@@ -97,6 +129,12 @@ def plot_sample_trajectory(ds: LeRobotDataset, action_key: str, output_dir: str)
 
 
 def print_summary(ds: LeRobotDataset, action_key: str):
+    """Print dataset statistics to help set normalization parameters.
+
+    The action range tells you whether mean/std or min-max normalization is
+    more appropriate. A large range with moderate std suggests min-max;
+    a Gaussian-looking range suggests z-score normalization.
+    """
     actions = torch.tensor(
         np.stack([ds.hf_dataset[i][action_key] for i in range(len(ds.hf_dataset))])
     )

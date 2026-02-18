@@ -22,8 +22,8 @@ import time
 
 import torch
 
-from act.policy.act_policy import ACTPolicy
 from act.dataset.normalizer import ACTNormalizer
+from act.policy.act_policy import ACTPolicy
 from inference.temporal_ensemble import InferencePipeline
 
 
@@ -50,16 +50,41 @@ def build_policy(state_dim, action_dim, chunk_size, num_cam, device):
 
 
 @torch.no_grad()
-def benchmark_single_step(policy, normalizer, state_dim, action_dim, num_cam,
-                           chunk_size, device, n_warmup=10, n_repeat=100):
-    """Benchmark a single policy.predict_action() call (one chunk query)."""
+def benchmark_single_step(
+    policy,
+    normalizer,
+    state_dim,
+    action_dim,
+    num_cam,
+    chunk_size,
+    device,
+    n_warmup=10,
+    n_repeat=100,
+):
+    """Benchmark a single policy.predict_action() call (one chunk query).
+
+    Key insight for ACT latency:
+      - One call produces `chunk_size` future actions via a single forward pass.
+      - In standard chunked execution, the robot executes all chunk_size actions
+        before re-querying the policy. So the amortized cost per robot step is:
+            latency_per_step = total_chunk_latency / chunk_size
+      - Larger chunk_size = more steps amortized = lower effective per-step cost,
+        but also less reactivity (slower replanning).
+
+    Why n_warmup:
+      - CUDA kernels are JIT-compiled on first use; warmup ensures we measure
+        steady-state throughput, not the one-time compilation overhead.
+      - Also fills the GPU memory allocator cache, giving stable timings.
+    """
     qpos = torch.randn(1, state_dim, device=device)
     image = torch.rand(1, num_cam, 3, 240, 320, device=device)
 
-    # Warmup
     for _ in range(n_warmup):
         _ = policy.predict_action(qpos, image)
 
+    # CUDA operations are asynchronous: the CPU queues work and returns immediately.
+    # torch.cuda.synchronize() forces the CPU to wait until all GPU ops complete,
+    # so our wall-clock timer accurately captures GPU time.
     if device == "cuda":
         torch.cuda.synchronize()
 
@@ -75,16 +100,42 @@ def benchmark_single_step(policy, normalizer, state_dim, action_dim, num_cam,
 
 
 @torch.no_grad()
-def benchmark_temporal_ensemble(policy, normalizer, state_dim, action_dim, num_cam,
-                                chunk_size, device, episode_len=50, n_repeat=5):
-    """Benchmark a full episode rollout with temporal ensembling."""
+def benchmark_temporal_ensemble(
+    policy,
+    normalizer,
+    state_dim,
+    action_dim,
+    num_cam,
+    chunk_size,
+    device,
+    episode_len=50,
+    n_repeat=5,
+):
+    """Benchmark a full episode rollout with temporal ensembling.
+
+    Temporal ensembling re-queries the policy at every robot step (not every
+    chunk_size steps). This yields smoother, more reactive behaviour because
+    it blends multiple overlapping predictions:
+        action_t = Σ w_i * ŷ_t  where w_i = exp(-m*i), i = prediction age
+
+    The cost tradeoff:
+      - Standard: 1 query per chunk_size steps → 1/chunk_size queries per step
+      - Temporal ensemble: 1 query per step → chunk_size× more expensive
+
+    For chunk_size=100 and 10 ms/query: standard = 0.1 ms/step (1000 Hz effective),
+    temporal ensemble = 10 ms/step (100 Hz). Practical control frequency dictates
+    which mode is feasible.
+    """
     pipeline = InferencePipeline(
-        policy, normalizer, chunk_size=chunk_size,
-        temporal_agg=True, max_timesteps=episode_len,
+        policy,
+        normalizer,
+        chunk_size=chunk_size,
+        temporal_agg=True,
+        max_timesteps=episode_len,
         device=device,
     )
 
-    # Warmup
+    # Warmup run to stabilize GPU state before measuring
     pipeline.reset()
     for t in range(episode_len):
         qpos = torch.randn(state_dim)
@@ -124,6 +175,8 @@ def main():
         print("CUDA not available, falling back to CPU")
         device = "cpu"
 
+    # fit_from_tensors: convenience method that avoids loading a real dataset,
+    # useful for benchmarking or unit testing the normalizer in isolation
     normalizer = ACTNormalizer()
     normalizer.fit_from_tensors(
         torch.randn(100, args.state_dim),
@@ -132,37 +185,48 @@ def main():
 
     chunk_sizes = [20, 50, 100]
 
-    print(f"\ndevice: {device}  |  state_dim={args.state_dim}  "
-          f"action_dim={args.action_dim}  num_cam={args.num_cam}")
+    print(
+        f"\ndevice: {device}  |  state_dim={args.state_dim}  "
+        f"action_dim={args.action_dim}  num_cam={args.num_cam}"
+    )
     print(f"{'mode':<22}  {'chunk_size':>10}  {'latency/step':>14}  {'freq':>8}")
     print("-" * 60)
 
     for chunk_size in chunk_sizes:
-        policy = build_policy(
-            args.state_dim, args.action_dim, chunk_size, args.num_cam, device
-        )
+        policy = build_policy(args.state_dim, args.action_dim, chunk_size, args.num_cam, device)
         n_params = sum(p.numel() for p in policy.parameters())
 
-        # Single-step inference
         lat_ms = benchmark_single_step(
-            policy, normalizer, args.state_dim, args.action_dim, args.num_cam,
-            chunk_size, device, n_repeat=args.n_repeat,
+            policy,
+            normalizer,
+            args.state_dim,
+            args.action_dim,
+            args.num_cam,
+            chunk_size,
+            device,
+            n_repeat=args.n_repeat,
         )
-        # Per-step cost: the chunk is queried once every chunk_size steps
+        # Amortized cost: the chunk is produced once and executed over chunk_size steps,
+        # so the per-robot-step cost is 1/chunk_size of the query latency
         per_step_ms = lat_ms / chunk_size
         freq = 1000 / per_step_ms
         print(f"{'standard chunk':<22}  {chunk_size:>10}  {per_step_ms:>12.2f} ms  {freq:>6.0f} Hz")
 
     print()
 
-    # Temporal ensemble (chunk_size=100 as default)
+    # Temporal ensemble with chunk_size=100: query once per step, blend predictions
     chunk_size = 100
-    policy = build_policy(
-        args.state_dim, args.action_dim, chunk_size, args.num_cam, device
-    )
+    policy = build_policy(args.state_dim, args.action_dim, chunk_size, args.num_cam, device)
     ms_per_step = benchmark_temporal_ensemble(
-        policy, normalizer, args.state_dim, args.action_dim, args.num_cam,
-        chunk_size, device, episode_len=args.episode_len, n_repeat=5,
+        policy,
+        normalizer,
+        args.state_dim,
+        args.action_dim,
+        args.num_cam,
+        chunk_size,
+        device,
+        episode_len=args.episode_len,
+        n_repeat=5,
     )
     freq = 1000 / ms_per_step
     print(f"{'temporal ensemble':<22}  {chunk_size:>10}  {ms_per_step:>12.2f} ms  {freq:>6.0f} Hz")
