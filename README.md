@@ -13,10 +13,6 @@ A from-scratch reimplementation of [Action Chunking with Transformers (ACT)](htt
 - [ ] **Demo** — Add demo GIF / video of real robot pick-and-place deployment
 - [ ] **Checkpoints** — Release trained checkpoints with download link
 - [ ] **Real environment evaluation** — `eval.py` currently supports mock rollouts only; a proper evaluation requires a gym-compatible simulated or real-robot environment
-- [x] **Train/inference normalization** — Fixed: training normalizes qpos and actions before loss, matching the inference pipeline
-- [x] **EMA** — Buffer-aware EMA (copies registered buffers alongside parameters) for stable inference weights
-- [x] **Step checkpointing** — `--save_every_steps` for crash recovery, independent of epoch checkpoints
-- [x] **Image augmentation** — `RandomCenterCrop` + `ColorJitter` that auto-switch train/eval mode via `self.training`
 
 ---
 
