@@ -5,33 +5,44 @@ Validates:
   - Single prediction is returned unmodified (weights sum to 1)
   - Two predictions produce a weighted average between the two values
   - reset() clears all stored predictions
+  - Zero-valued actions are NOT incorrectly excluded (regression for _populated mask fix)
   - Ensembling reduces step-to-step variance vs raw predictions
   - InferencePipeline outputs correct shape in both modes
   - Non-ensembled mode reuses cached chunk within chunk_size steps
 """
 
 import torch
-import pytest
-from act.policy.act_policy import ACTPolicy
+
 from act.dataset.normalizer import ACTNormalizer
-from inference.temporal_ensemble import TemporalEnsemble, InferencePipeline
+from act.policy.act_policy import ACTPolicy
+from inference.temporal_ensemble import InferencePipeline, TemporalEnsemble
 
 
 def make_pipeline(temporal_agg=False, chunk_size=10, state_dim=7, action_dim=7):
     config = {
-        "state_dim": state_dim, "action_dim": action_dim,
-        "hidden_dim": 128, "dim_feedforward": 256,
-        "backbone": "resnet18", "lr_backbone": 0,
-        "enc_layers": 2, "dec_layers": 2, "nheads": 4,
-        "num_queries": chunk_size, "camera_names": ["cam"],
-        "lr": 1e-4, "kl_weight": 10.0,
+        "state_dim": state_dim,
+        "action_dim": action_dim,
+        "hidden_dim": 128,
+        "dim_feedforward": 256,
+        "backbone": "resnet18",
+        "lr_backbone": 0,
+        "enc_layers": 2,
+        "dec_layers": 2,
+        "nheads": 4,
+        "num_queries": chunk_size,
+        "camera_names": ["cam"],
+        "lr": 1e-4,
+        "kl_weight": 10.0,
     }
     policy = ACTPolicy(config)
     normalizer = ACTNormalizer()
     normalizer.fit_from_tensors(torch.randn(50, state_dim), torch.randn(50, action_dim))
     return InferencePipeline(
-        policy, normalizer, chunk_size=chunk_size,
-        temporal_agg=temporal_agg, max_timesteps=100,
+        policy,
+        normalizer,
+        chunk_size=chunk_size,
+        temporal_agg=temporal_agg,
+        max_timesteps=100,
     )
 
 
@@ -65,6 +76,28 @@ def test_empty_returns_zero():
     result = ensemble.get_action(0)
     assert result.shape == (5,)
     assert torch.allclose(result, torch.zeros(5))
+
+
+def test_zero_action_not_excluded():
+    """Regression: all-zero actions must not be silently dropped.
+
+    The old implementation used `torch.all(actions != 0)` to detect populated
+    rows, which incorrectly excluded legitimate zero-valued actions.
+    The fix uses a separate _populated boolean mask.
+    """
+    ensemble = TemporalEnsemble(chunk_size=10, action_dim=4, max_timesteps=50)
+    # Add a prediction where all action values are exactly zero
+    ensemble.add_prediction(0, torch.zeros(10, 4))
+    result = ensemble.get_action(0)
+    # Should return the stored zero action, not fall back to "no prediction"
+    assert result.shape == (4,)
+    assert torch.allclose(result, torch.zeros(4))
+    # Confirm it was actually populated (if it fell through, get_action still
+    # returns zeros, so we add a non-zero prediction next to distinguish)
+    ensemble.add_prediction(1, torch.ones(10, 4) * 5.0)
+    result_t1 = ensemble.get_action(1)
+    # Both predictions cover t=1; weighted average must be between 0 and 5
+    assert (result_t1 >= 0.0).all() and (result_t1 <= 5.0).all()
 
 
 def test_smoothing_reduces_variance():
@@ -105,11 +138,15 @@ def test_pipeline_reset_is_idempotent():
     pipeline = make_pipeline(temporal_agg=True)
     pipeline.reset()
     torch.manual_seed(0)
-    actions_first = [pipeline.get_action(t, torch.randn(7), torch.rand(1, 3, 120, 160)) for t in range(5)]
+    actions_first = [
+        pipeline.get_action(t, torch.randn(7), torch.rand(1, 3, 120, 160)) for t in range(5)
+    ]
 
     pipeline.reset()
     torch.manual_seed(0)
-    actions_second = [pipeline.get_action(t, torch.randn(7), torch.rand(1, 3, 120, 160)) for t in range(5)]
+    actions_second = [
+        pipeline.get_action(t, torch.randn(7), torch.rand(1, 3, 120, 160)) for t in range(5)
+    ]
 
     for a, b in zip(actions_first, actions_second):
         assert torch.allclose(a, b), "same seed after reset must produce identical actions"

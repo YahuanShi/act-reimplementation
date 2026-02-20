@@ -33,8 +33,8 @@ Data structure:
     that have a prediction for that timestep
 """
 
-import torch
 import numpy as np
+import torch
 
 
 class TemporalEnsemble:
@@ -52,23 +52,27 @@ class TemporalEnsemble:
         device: torch device for computation
     """
 
-    def __init__(self, chunk_size, action_dim, max_timesteps, k=0.01,
-                 device='cpu'):
+    def __init__(self, chunk_size, action_dim, max_timesteps, k=0.01, device="cpu"):
         self.chunk_size = chunk_size
         self.action_dim = action_dim
         self.max_timesteps = max_timesteps
         self.k = k
         self.device = device
 
-        # Prediction buffer: row t stores the chunk predicted at timestep t
-        # Columns extend to max_timesteps + chunk_size to handle the last chunk
+        # Prediction buffer: row t stores the chunk predicted at timestep t.
+        # Columns extend to max_timesteps + chunk_size to handle the last chunk.
         self.all_time_actions = torch.zeros(
-            max_timesteps, max_timesteps + chunk_size, action_dim,
-            device=device)
+            max_timesteps, max_timesteps + chunk_size, action_dim, device=device
+        )
+
+        # Boolean mask tracking which rows have been written.
+        # Avoids the bug of treating legitimate zero-valued actions as "empty".
+        self._populated = torch.zeros(max_timesteps, dtype=torch.bool, device=device)
 
     def reset(self):
         """Clear all stored predictions for a new episode."""
         self.all_time_actions.zero_()
+        self._populated.zero_()
 
     def add_prediction(self, t, actions):
         """
@@ -81,15 +85,16 @@ class TemporalEnsemble:
         """
         if actions.dim() == 3:
             actions = actions.squeeze(0)
-        self.all_time_actions[t, t:t + self.chunk_size] = actions
+        self.all_time_actions[t, t : t + self.chunk_size] = actions
+        self._populated[t] = True
 
     def get_action(self, t):
         """
         Get the ensembled action for timestep t.
 
-        Collects all predictions that target timestep t (from chunks
-        predicted at times t, t-1, ..., max(0, t-chunk_size+1)),
-        then computes a weighted average using exponential decay.
+        Collects all predictions that cover timestep t — these come from
+        chunks queried at times s in [max(0, t-chunk_size+1), t] — then
+        computes a weighted average using exponential decay.
 
         Args:
             t: timestep to get the action for
@@ -97,25 +102,24 @@ class TemporalEnsemble:
         Returns:
             action: (action_dim,) smoothed action
         """
-        # Gather all predictions for timestep t (column t across all rows)
-        actions_for_t = self.all_time_actions[:, t]  # (max_timesteps, action_dim)
-
-        # Find which rows have non-zero predictions for this timestep
-        # (a row is "populated" if any dimension is non-zero)
-        actions_populated = torch.all(actions_for_t != 0, axis=1)
-        actions_for_t = actions_for_t[actions_populated]
+        # Only rows s in [t-chunk_size+1, t] can have a prediction for timestep t.
+        # Slicing to this range avoids scanning the full buffer and correctly
+        # excludes rows outside the prediction window.
+        start = max(0, t - self.chunk_size + 1)
+        end = t + 1
+        actions_for_t = self.all_time_actions[start:end, t]
+        populated = self._populated[start:end]
+        actions_for_t = actions_for_t[populated]
 
         if len(actions_for_t) == 0:
             return torch.zeros(self.action_dim, device=self.device)
 
-        # Compute exponential weights: earlier predictions get higher weight
-        # index 0 = earliest prediction for this timestep (most "aged")
+        # Exponential weights: index 0 = oldest prediction (highest weight).
+        # Older predictions carry more temporal context; newer ones may be jittery.
         exp_weights = np.exp(-self.k * np.arange(len(actions_for_t)))
         exp_weights = exp_weights / exp_weights.sum()
-        exp_weights = torch.from_numpy(exp_weights).float().to(
-            self.device).unsqueeze(1)
+        exp_weights = torch.from_numpy(exp_weights).float().to(self.device).unsqueeze(1)
 
-        # Weighted average
         action = (actions_for_t * exp_weights).sum(dim=0)
         return action
 
@@ -141,8 +145,16 @@ class InferencePipeline:
         device: torch device
     """
 
-    def __init__(self, policy, normalizer, chunk_size, temporal_agg=False,
-                 max_timesteps=400, k=0.01, device='cpu'):
+    def __init__(
+        self,
+        policy,
+        normalizer,
+        chunk_size,
+        temporal_agg=False,
+        max_timesteps=400,
+        k=0.01,
+        device="cpu",
+    ):
         self.policy = policy
         self.normalizer = normalizer
         self.chunk_size = chunk_size
@@ -156,8 +168,7 @@ class InferencePipeline:
         action_dim = policy.model.action_dim
 
         if temporal_agg:
-            self.ensemble = TemporalEnsemble(
-                chunk_size, action_dim, max_timesteps, k, device)
+            self.ensemble = TemporalEnsemble(chunk_size, action_dim, max_timesteps, k, device)
         else:
             self.ensemble = None
 
@@ -197,11 +208,9 @@ class InferencePipeline:
         else:
             # Query policy every chunk_size steps
             if t % self.chunk_size == 0:
-                self._cached_actions = self.policy.predict_action(
-                    qpos, image)  # (1, chunk, act)
+                self._cached_actions = self.policy.predict_action(qpos, image)  # (1, chunk, act)
             action_norm = self._cached_actions[0, t % self.chunk_size]
 
         # Denormalize to raw action space
-        action_raw = self.normalizer.denormalize_action(
-            action_norm.unsqueeze(0)).squeeze(0)
+        action_raw = self.normalizer.denormalize_action(action_norm.unsqueeze(0)).squeeze(0)
         return action_raw.cpu()
