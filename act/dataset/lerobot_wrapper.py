@@ -18,8 +18,9 @@ This adapter uses LeRobot's delta_timestamps mechanism:
   - state timestamps:  [0]  (current state only)
 
 When a sample is near the end of an episode, some future action timestamps
-will fall outside the episode. LeRobot handles this by clamping to the last
-available frame. We detect these clamped positions and mark them in is_pad.
+will fall outside the episode. LeRobot clamps these to the last available
+frame and returns a '<key>_is_pad' mask marking them, which we pass through
+as is_pad.
 
 Output format per sample:
   {
@@ -30,9 +31,10 @@ Output format per sample:
   }
 """
 
+import numpy as np
 import torch
-from torch.utils.data import Dataset
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from torch.utils.data import Dataset
 
 
 class LeRobotACTDataset(Dataset):
@@ -51,28 +53,34 @@ class LeRobotACTDataset(Dataset):
         image_transforms: optional image augmentation transforms
     """
 
-    def __init__(self, repo_id, root=None, episodes=None,
-                 chunk_size=100,
-                 image_keys=None,
-                 state_key='observation.state',
-                 action_key='action',
-                 video_backend='pyav',
-                 image_transforms=None):
+    def __init__(
+        self,
+        repo_id,
+        root=None,
+        episodes=None,
+        chunk_size=100,
+        image_keys=None,
+        state_key="observation.state",
+        action_key="action",
+        video_backend="pyav",
+        image_transforms=None,
+    ):
 
         # First pass: load metadata to discover features and fps
         meta_ds = LeRobotDataset(
-            repo_id=repo_id, root=root, episodes=episodes,
-            video_backend=video_backend)
+            repo_id=repo_id, root=root, episodes=episodes, video_backend=video_backend
+        )
         fps = meta_ds.fps
         features = meta_ds.features
 
         # Auto-detect image keys if not provided
         if image_keys is None:
             image_keys = sorted(
-                k for k, v in features.items()
-                if v.get('dtype') == 'video' or
-                (isinstance(v.get('shape', ()), (list, tuple))
-                 and len(v['shape']) == 3))
+                k
+                for k, v in features.items()
+                if v.get("dtype") == "video"
+                or (isinstance(v.get("shape", ()), (list, tuple)) and len(v["shape"]) == 3)
+            )
 
         # Build delta_timestamps for each feature
         # Action: sample chunk_size future steps starting from current frame
@@ -91,10 +99,13 @@ class LeRobotACTDataset(Dataset):
 
         # Second pass: create the actual dataset with delta_timestamps
         self.ds = LeRobotDataset(
-            repo_id=repo_id, root=root, episodes=episodes,
+            repo_id=repo_id,
+            root=root,
+            episodes=episodes,
             video_backend=video_backend,
             image_transforms=image_transforms,
-            delta_timestamps=dt)
+            delta_timestamps=dt,
+        )
 
         self.chunk_size = chunk_size
         self.fps = fps
@@ -126,7 +137,7 @@ class LeRobotACTDataset(Dataset):
             state = item[self.state_key]
             if state.dim() == 2:
                 state = state.squeeze(0)
-            out['qpos'] = state
+            out["qpos"] = state
 
         # ── Images ──
         # Stack multiple cameras into (num_cam, 3, H, W)
@@ -137,68 +148,38 @@ class LeRobotACTDataset(Dataset):
             if img.dim() == 4:
                 img = img.squeeze(0)
             cam_images.append(img)
-        out['image'] = torch.stack(cam_images, dim=0)  # (num_cam, 3, H, W)
+        out["image"] = torch.stack(cam_images, dim=0)  # (num_cam, 3, H, W)
 
         # ── Actions + is_pad ──
         # action shape: (chunk_size, action_dim)
         action = item[self.action_key]
-        out['action'] = action
+        out["action"] = action
 
-        # Build is_pad mask by checking which timestamps were clamped.
-        # LeRobot provides 'action_is_pad' or we can detect by checking
-        # the timestamp_key. We use a simple heuristic: check the episode
-        # index boundaries.
-        is_pad = self._compute_is_pad(item, idx)
-        out['is_pad'] = is_pad
+        # LeRobot marks the clamped (beyond-episode) timesteps of every
+        # delta_timestamps key with a '<key>_is_pad' boolean mask.
+        out["is_pad"] = item[f"{self.action_key}_is_pad"]
 
         return out
 
-    def _compute_is_pad(self, item, idx):
+    def episode_indices(self):
         """
-        Compute the is_pad mask for the action chunk.
+        Episode index of every sample, as a numpy array of length len(self).
 
-        Near the end of an episode, some future timesteps in the action chunk
-        fall beyond the episode boundary. LeRobot clamps these to the last
-        available frame, resulting in duplicated actions at the tail. We detect
-        this by checking the episode index boundaries.
-
-        Returns:
-            is_pad: (chunk_size,) boolean tensor
+        Used to split train/val by episode: neighbouring frames are almost
+        identical, so a random per-frame split leaks training data into val.
         """
-        is_pad = torch.zeros(self.chunk_size, dtype=torch.bool)
-
-        # Get the current sample's episode index and position within episode
-        current_idx = idx
-        ep_idx = self.ds.hf_dataset[current_idx]['episode_index']
-
-        # Find the last sample index belonging to this episode
-        # by scanning forward (at most chunk_size steps)
-        hf = self.ds.hf_dataset
-        total_len = len(hf)
-
-        for offset in range(self.chunk_size):
-            future_idx = current_idx + offset
-            if future_idx >= total_len:
-                # Beyond dataset end -> padding
-                is_pad[offset:] = True
-                break
-            if hf[future_idx]['episode_index'] != ep_idx:
-                # Crossed into next episode -> padding
-                is_pad[offset:] = True
-                break
-
-        return is_pad
+        return np.asarray(self.ds.hf_dataset["episode_index"])
 
     @property
     def state_dim(self):
         """Infer state dimension from dataset features."""
         if self.has_state:
             feat = self.ds.features[self.state_key]
-            return feat['shape'][0] if isinstance(feat['shape'], (list, tuple)) else feat['shape']
+            return feat["shape"][0] if isinstance(feat["shape"], (list, tuple)) else feat["shape"]
         return None
 
     @property
     def action_dim(self):
         """Infer action dimension from dataset features."""
         feat = self.ds.features[self.action_key]
-        return feat['shape'][0] if isinstance(feat['shape'], (list, tuple)) else feat['shape']
+        return feat["shape"][0] if isinstance(feat["shape"], (list, tuple)) else feat["shape"]

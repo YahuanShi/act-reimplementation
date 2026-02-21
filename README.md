@@ -12,7 +12,7 @@ A from-scratch reimplementation of [Action Chunking with Transformers (ACT)](htt
 
 - [ ] **Demo** — Add demo GIF / video of real robot pick-and-place deployment
 - [ ] **Checkpoints** — Release trained checkpoints with download link
-- [ ] **Real environment evaluation** — `eval.py` currently supports mock rollouts only; a proper evaluation requires a gym-compatible simulated or real-robot environment
+- [ ] **Sim results** — Train on ALOHA TransferCube and report success rate (paper: ~90% scripted, ~50% human data)
 
 ---
 
@@ -28,7 +28,7 @@ This is a **from-scratch reimplementation** of ACT, not a fork. Every line of co
 | **Config system** | argparse + hardcoded constants | Plain argparse, single `train.py` |
 | **Data format** | HDF5 / RoboMimic | LeRobot v3 (modern standard) |
 | **EMA** | Not used | Buffer-aware EMA for stable inference |
-| **Image augmentation** | Random crop only | `RandomCenterCrop` + `ColorJitter` (train/eval auto-switch) |
+| **Image augmentation** | Random crop only | `RandomCenterCrop` + `ColorJitter` (opt-in via `--crop_ratio`, `--color_jitter`) |
 | **LR schedule** | Constant | Cosine annealing with warmdown |
 | **Checkpointing** | Epoch only | Epoch + step-level (crash recovery) |
 | **Comments** | Minimal | Learning-note style: explains the *why* behind each design |
@@ -241,13 +241,15 @@ Input:
 ├── inference/
 │   └── temporal_ensemble.py        # InferencePipeline with temporal ensembling
 ├── evaluation/
-│   └── runner.py                   # Rollout runner and mock environment
+│   ├── runner.py                   # Rollout runner (success via info['is_success']) + mock env
+│   └── aloha_env.py                # gym-aloha (MuJoCo) adapter → ACT observation format
 ├── tests/
 │   ├── test_policy.py              # ACTPolicy loss and inference shape tests
 │   ├── test_normalizer.py          # Normalizer fit, normalize, denormalize
 │   ├── test_temporal_ensemble.py   # TemporalEnsemble correctness
 │   ├── test_ema.py                 # EMA decay schedule, step, copy_to, state_dict
-│   └── test_integration.py         # End-to-end pipeline smoke test
+│   ├── test_integration.py         # End-to-end pipeline smoke test
+│   └── test_eval.py                # Rollout success logic, augmentation, ALOHA env adapter
 ├── scripts/
 │   ├── hdf5_to_lerobot.py          # HDF5 robot episodes → LeRobot v3 format
 │   ├── visualize_dataset.py        # Plot action distributions and trajectories
@@ -263,7 +265,7 @@ Input:
 │   ├── 08_inference_test.py        # InferencePipeline and temporal ensembling
 │   └── 09_integration_test.py      # Full pipeline: dataset → train → checkpoint → infer
 ├── train.py                        # Training entry point
-├── eval.py                         # Evaluation entry point (mock env)
+├── eval.py                         # Evaluation entry point (ALOHA sim or mock env)
 ├── inference.py                    # Real robot inference (UR + Weiss gripper + RealSense)
 ├── setup.sh                        # One-click environment setup (uv)
 └── pyproject.toml                  # Dependencies and project metadata
@@ -280,6 +282,9 @@ bash setup.sh
 # Or manually
 uv venv && uv sync --extra dev
 
+# (Optional) ALOHA MuJoCo simulation for evaluation (gym-aloha)
+uv sync --extra dev --extra sim
+
 # (Optional) robot hardware dependencies
 uv sync --extra robot
 
@@ -295,16 +300,28 @@ Requires Python 3.10+ and a CUDA-capable GPU for training.
 
 ### Training
 
+> **Epochs here are not the paper's epochs.** One epoch is a pass over *every frame*;
+> the original ACT samples one frame per episode per epoch. For ALOHA sim
+> (50 episodes × 400 frames, batch 8) one epoch ≈ 2250 steps, so `--epochs 20`
+> (≈ 45k steps) is in the range of the paper's training budget, while the paper's
+> `2000` would be ~400× longer.
+
 ```bash
-# Basic (HuggingFace dataset)
+# ALOHA sim pick-and-place (scripted demos — start here)
 python train.py \
-    --dataset lerobot/aloha_sim_transfer_cube_human \
-    --chunk_size 100 --epochs 2000 --batch_size 8
+    --dataset lerobot/aloha_sim_transfer_cube_scripted \
+    --chunk_size 100 --epochs 20 --batch_size 8 \
+    --ckpt_dir checkpoints/transfer_cube_scripted
 
 # Local dataset (--data_root must point to the dataset directory, not its parent)
 python train.py \
     --dataset local/ur5_pick_place --data_root ./data/ur5_pick_place \
-    --chunk_size 50 --epochs 3000 --batch_size 16
+    --chunk_size 50 --epochs 30 --batch_size 16
+
+# With augmentation (random crop to 95% of H/W + color jitter; center crop at eval)
+python train.py \
+    --dataset lerobot/aloha_sim_transfer_cube_human \
+    --crop_ratio 0.95 --color_jitter
 
 # With wandb logging
 python train.py \
@@ -324,13 +341,16 @@ Key arguments:
 | `--dataset` | required | LeRobot dataset repo_id |
 | `--data_root` | None | Local dataset root directory |
 | `--chunk_size` | 100 | Action chunk length (`num_queries`) |
-| `--epochs` | 2000 | Number of training epochs |
+| `--epochs` | 20 | Passes over all frames (see note above) |
+| `--val_ratio` | 0.1 | Fraction of **episodes** held out for validation |
 | `--batch_size` | 8 | Batch size |
 | `--lr` | 1e-5 | Learning rate |
 | `--kl_weight` | 10.0 | CVAE KL divergence weight (β) |
 | `--latent_dim` | 32 | CVAE latent dimension |
 | `--grad_clip` | 1.0 | Gradient clipping max norm |
-| `--save_every` | 100 | Save epoch checkpoint every N epochs |
+| `--save_every` | 5 | Save epoch checkpoint every N epochs |
+| `--crop_ratio` | 1.0 | Random-crop fraction of H/W during training (1.0 = off) |
+| `--color_jitter` | False | Color jitter during training |
 | `--save_every_steps` | 0 | Save step checkpoint every N steps (0 = off) |
 | `--no_ema` | — | Disable EMA (EMA is on by default) |
 | `--wandb` | False | Enable wandb logging |
@@ -353,7 +373,7 @@ Output files (saved to `--ckpt_dir`, default `checkpoints/`):
 python train.py \
     --dataset lerobot/aloha_sim_transfer_cube_human \
     --resume checkpoints/checkpoint_full.pt \
-    --epochs 3000
+    --epochs 30
 ```
 
 ### Real Robot Inference (UR + Weiss CRG + RealSense)
@@ -383,11 +403,29 @@ python inference.py \
     --frequency 10 --chunk_size 50 --max_steps 500
 ```
 
-### Evaluation (Mock)
+### Evaluation (ALOHA Simulation)
+
+Rolls out the policy in gym-aloha (MuJoCo, rendered headless via EGL) and reports
+the success rate. Requires `uv sync --extra sim`.
 
 ```bash
-python eval.py --ckpt_dir checkpoints --dataset lerobot/aloha_sim_transfer_cube_human
+# 50 episodes of TransferCube, chunked execution, 5 videos saved
+python eval.py --ckpt_dir checkpoints/transfer_cube_scripted --env aloha
+
+# Same with temporal ensembling
+python eval.py --ckpt_dir checkpoints/transfer_cube_scripted --env aloha --temporal_agg
+
+# Insertion task (train on lerobot/aloha_sim_insertion_scripted first)
+python eval.py --ckpt_dir checkpoints/insertion --env aloha --task AlohaInsertion-v0
+
+# Pipeline check without a simulator (random observations)
+python eval.py --ckpt_dir checkpoints --env mock --n_episodes 2
 ```
+
+An episode is a success when the env reports `info["is_success"]` (TransferCube:
+reward 4 — cube held by the left gripper, off the table). Episode `i` resets with
+`--seed + i`, so runs are reproducible. Results go to `<ckpt_dir>/eval_aloha_{chunk,tagg}/`:
+`eval_results.json` plus `episode_XXX_{success,fail}.mp4`. Without EGL, set `MUJOCO_GL=osmesa`.
 
 ### Scripts
 
@@ -409,7 +447,7 @@ python scripts/benchmark_inference.py --device cuda --num_cam 2
 pytest tests/ -v
 ```
 
-33 tests covering normalizer, policy, temporal ensembling, EMA, and end-to-end integration.
+40 tests covering normalizer, policy, temporal ensembling, EMA, evaluation rollouts, augmentation, and end-to-end integration.
 
 ---
 

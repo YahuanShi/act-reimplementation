@@ -26,6 +26,9 @@ robot = [
     "pyrealsense2>=2.55",
     "pyserial>=3.5",
 ]
+sim = [
+    "gym-aloha>=0.1.2,<0.2.0",
+]
 
 [project.scripts]
 act-train = "train:main"

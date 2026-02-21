@@ -35,6 +35,7 @@ import torch.nn as nn
 import torchvision.transforms as transforms
 from torch.nn import functional as F
 
+from act.model.augmentation import ColorJitter, RandomCenterCrop
 from act.model.detr_vae import build_act_model, kl_divergence
 
 
@@ -54,7 +55,10 @@ class ACTPolicy(nn.Module):
                 num_queries, camera_names, lr, kl_weight
             Optional keys:
                 latent_dim (default 32), dropout (default 0.1),
-                pre_norm (default False), weight_decay (default 1e-4)
+                pre_norm (default False), weight_decay (default 1e-4),
+                crop_size (default None: [h, w] random crop in train mode,
+                    center crop in eval mode),
+                color_jitter (default False: jitter in train mode only)
     """
 
     def __init__(self, config):
@@ -67,6 +71,13 @@ class ACTPolicy(nn.Module):
         # The ResNet backbone was pretrained on ImageNet-normalized images, so
         # we must apply the same normalization at both training and inference.
         self.normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+
+        # Optional augmentation. Both modules switch behaviour on self.training,
+        # so train()/eval() alone picks random crop + jitter vs center crop.
+        # The center crop at eval keeps inference on the same image size as training.
+        crop_size = config.get("crop_size")
+        self.crop = RandomCenterCrop(crop_size) if crop_size else nn.Identity()
+        self.jitter = ColorJitter() if config.get("color_jitter", False) else nn.Identity()
 
     def compute_loss(self, qpos, image, actions, is_pad):
         """
@@ -163,16 +174,20 @@ class ACTPolicy(nn.Module):
 
     def _normalize_images(self, image):
         """
-        Apply ImageNet normalization to a batch of multi-camera images.
+        Apply optional crop/jitter, then ImageNet normalization, to a batch of
+        multi-camera images.
 
         Args:
             image: (bs, num_cam, 3, H, W) with values in [0, 1]
 
         Returns:
-            normalized image tensor with same shape
+            normalized image tensor (bs, num_cam, 3, H', W'); H', W' differ
+            from H, W only when crop_size is set
         """
         bs, num_cam, C, H, W = image.shape
         # Merge batch and camera dims, apply normalize once, restore shape.
         # transforms.Normalize operates channel-wise on (..., C, H, W) tensors.
-        image = self.normalize(image.view(bs * num_cam, C, H, W))
-        return image.view(bs, num_cam, C, H, W)
+        image = image.reshape(bs * num_cam, C, H, W)
+        image = self.jitter(self.crop(image))
+        image = self.normalize(image)
+        return image.view(bs, num_cam, C, *image.shape[-2:])

@@ -51,7 +51,7 @@ class TrainWorkspace:
                 backbone, lr_backbone, enc_layers, dec_layers, nheads,
                 num_queries, camera_names, lr, kl_weight
             Training keys: num_epochs, batch_size, ckpt_dir, seed,
-                save_every (default 100), grad_clip (default 1.0),
+                save_every (default 5), grad_clip (default 1.0),
                 use_wandb (default False), wandb_project (default "ACT"),
                 wandb_run_name (default None), resume (default None),
                 max_keep_ckpts (default 5)
@@ -77,7 +77,7 @@ class TrainWorkspace:
         """
         config = self.config
         num_epochs = config["num_epochs"]
-        save_every = config.get("save_every", 100)
+        save_every = config.get("save_every", 5)
         save_every_steps = config.get("save_every_steps", 0)
         grad_clip = config.get("grad_clip", 1.0)
         use_wandb = config.get("use_wandb", False)
@@ -182,19 +182,18 @@ class TrainWorkspace:
             train_history.extend(epoch_train_losses)
             epoch_train_summary = _compute_dict_mean(epoch_train_losses)
 
-            # ── Console log ──
-            if epoch % 10 == 0 or epoch == num_epochs - 1:
-                print(f"\nEpoch {epoch}/{num_epochs}")
-                print(
-                    f"  Train loss: {epoch_train_summary['loss'].item():.5f} "
-                    f"(l1: {epoch_train_summary['l1'].item():.5f}, "
-                    f"kl: {epoch_train_summary['kl'].item():.5f})"
-                )
-                print(
-                    f"  Val loss:   {epoch_val_loss:.5f} "
-                    f"(l1: {val_summary['l1'].item():.5f}, "
-                    f"kl: {val_summary['kl'].item():.5f})"
-                )
+            # ── Console log (every epoch: one epoch covers every frame) ──
+            print(f"\nEpoch {epoch}/{num_epochs}")
+            print(
+                f"  Train loss: {epoch_train_summary['loss'].item():.5f} "
+                f"(l1: {epoch_train_summary['l1'].item():.5f}, "
+                f"kl: {epoch_train_summary['kl'].item():.5f})"
+            )
+            print(
+                f"  Val loss:   {epoch_val_loss:.5f} "
+                f"(l1: {val_summary['l1'].item():.5f}, "
+                f"kl: {val_summary['kl'].item():.5f})"
+            )
 
             # ── WandB epoch log ──
             if use_wandb:

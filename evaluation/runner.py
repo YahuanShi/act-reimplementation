@@ -17,13 +17,16 @@ future actions, which are then executed sequentially. Two modes are supported:
 Both modes share the same interface: call runner.run(policy) and it returns
 per-episode metrics aggregated over n_test rollouts.
 
-For real robot integration, subclass EvalRunner and override env_factory to
-return a hardware environment that conforms to the gym-style interface:
-  obs  = env.reset()  → dict: { 'qpos': (state_dim,), 'image': (C,H,W) or [(C,H,W)] }
-  obs, reward, done, info = env.step(action)  → action: (action_dim,)
-"""
+Environments must follow the gymnasium interface, with dict observations
+already converted to ACT's input format (see evaluation/aloha_env.py):
+  obs, info = env.reset(seed=seed)
+      obs = { 'qpos': (state_dim,), 'image': (num_cam, 3, H, W) float in [0, 1] }
+  obs, reward, terminated, truncated, info = env.step(action)   action: (action_dim,)
 
-from collections import defaultdict
+An episode counts as a success if the env ever reports info['is_success'].
+Termination alone is NOT success: an episode can also end by time limit.
+Optionally, env.render() returning an (H, W, 3) uint8 frame enables videos.
+"""
 
 import numpy as np
 import torch
@@ -31,47 +34,63 @@ import torch
 from inference.temporal_ensemble import InferencePipeline
 
 
-def run_episode(env, pipeline, max_steps=400):
+def run_episode(env, pipeline, max_steps=400, seed=None, record=False):
     """
     Roll out one episode using an InferencePipeline.
 
     The pipeline handles both chunked and temporal-ensemble modes internally.
-    The environment must expose gym-style reset() / step() with dict observations.
 
     Args:
-        env: gym-style environment with dict obs space
+        env: gymnasium-style environment with ACT-format dict obs
         pipeline: InferencePipeline (already configured with policy + normalizer)
         max_steps: episode length cap
+        seed: reset seed (controls the object's initial position)
+        record: collect env.render() frames for a video
 
     Returns:
-        dict: { 'total_reward', 'steps', 'done' }
+        dict: { 'total_reward', 'max_reward', 'steps', 'success', 'frames' }
     """
-    obs = env.reset()
+    obs, info = env.reset(seed=seed)
     pipeline.reset()
     total_reward = 0.0
-    done = False
+    max_reward = float("-inf")
+    success = bool(info.get("is_success", False))
+    frames = [env.render()] if record else []
     step = 0
 
-    while not done and step < max_steps:
-        qpos = torch.tensor(obs["qpos"], dtype=torch.float32)
-        image = torch.tensor(obs["image"], dtype=torch.float32)
+    while step < max_steps:
+        qpos = torch.as_tensor(obs["qpos"], dtype=torch.float32)
+        image = torch.as_tensor(obs["image"], dtype=torch.float32)
         # image expected as (num_cam, 3, H, W); add cam dim if single camera
         if image.dim() == 3:
             image = image.unsqueeze(0)
 
         action = pipeline.get_action(step, qpos, image)
-        action_np = action.cpu().numpy()
-
-        obs, reward, done, info = env.step(action_np)
+        obs, reward, terminated, truncated, info = env.step(action.numpy())
         total_reward += reward
+        max_reward = max(max_reward, reward)
+        success = success or bool(info.get("is_success", False))
         step += 1
+        if record:
+            frames.append(env.render())
+        if terminated or truncated:
+            break
 
-    return {"total_reward": total_reward, "steps": step, "done": done}
+    return {
+        "total_reward": float(total_reward),
+        "max_reward": float(max_reward),
+        "steps": step,
+        "success": success,
+        "frames": frames,
+    }
 
 
 class EvalRunner:
     """
     Multi-episode evaluation runner for ACT policies.
+
+    One env and one pipeline are built and reused; each episode resets both,
+    and episode i is reset with seed + i so results are reproducible.
 
     Args:
         env_factory: callable that returns a fresh environment instance
@@ -83,6 +102,8 @@ class EvalRunner:
         n_test: number of rollout episodes
         max_steps: maximum steps per episode
         device: torch device for inference
+        seed: base reset seed
+        num_videos: record frames for the first num_videos episodes
     """
 
     def __init__(
@@ -96,6 +117,8 @@ class EvalRunner:
         n_test=50,
         max_steps=400,
         device="cpu",
+        seed=0,
+        num_videos=0,
     ):
         self.env_factory = env_factory
         self.policy = policy
@@ -106,42 +129,55 @@ class EvalRunner:
         self.n_test = n_test
         self.max_steps = max_steps
         self.device = device
+        self.seed = seed
+        self.num_videos = num_videos
 
     def run(self):
         """
         Run n_test episodes and aggregate metrics.
 
         Returns:
-            dict with mean/std/max/min reward, episode count, per-episode results
+            dict with success rate, reward stats, episode count and per-episode
+            results (each with 'frames' if recorded)
         """
+        env = self.env_factory()
+        pipeline = InferencePipeline(
+            self.policy,
+            self.normalizer,
+            chunk_size=self.chunk_size,
+            temporal_agg=self.temporal_agg,
+            max_timesteps=self.max_steps,
+            k=self.k,
+            device=self.device,
+        )
         results = []
         for ep_idx in range(self.n_test):
-            env = self.env_factory()
-            pipeline = InferencePipeline(
-                self.policy,
-                self.normalizer,
-                chunk_size=self.chunk_size,
-                temporal_agg=self.temporal_agg,
-                max_timesteps=self.max_steps,
-                k=self.k,
-                device=self.device,
+            result = run_episode(
+                env,
+                pipeline,
+                max_steps=self.max_steps,
+                seed=self.seed + ep_idx,
+                record=ep_idx < self.num_videos,
             )
-            result = run_episode(env, pipeline, max_steps=self.max_steps)
             results.append(result)
+            n_success = sum(r["success"] for r in results)
             print(
                 f"  Episode {ep_idx + 1:3d}/{self.n_test}: "
-                f"reward={result['total_reward']:.3f}  "
+                f"success={result['success']!s:5}  "
+                f"max_reward={result['max_reward']:.1f}  "
                 f"steps={result['steps']}  "
-                f"done={result['done']}"
+                f"(running success {n_success}/{len(results)})"
             )
+        if hasattr(env, "close"):
+            env.close()
 
         rewards = [r["total_reward"] for r in results]
         return {
+            "success_rate": float(np.mean([r["success"] for r in results])),
             "mean_reward": float(np.mean(rewards)),
             "std_reward": float(np.std(rewards)),
             "max_reward": float(np.max(rewards)),
             "min_reward": float(np.min(rewards)),
-            "success_rate": float(np.mean([r["done"] for r in results])),
             "n_episodes": len(results),
             "results": results,
         }
@@ -176,22 +212,24 @@ class MockEnv:
         self.episode_len = episode_len
         self._step = 0
 
-    def reset(self):
+    def reset(self, seed=None):
         self._step = 0
-        return self._obs()
+        return self._obs(), {"is_success": False}
 
     def step(self, action):
         self._step += 1
         obs = self._obs()
         # Reward: negative L2 norm of action (encourage small actions)
         reward = float(-np.sum(action**2) * 0.01)
-        done = self._step >= self.episode_len
-        return obs, reward, done, {}
+        # The mock task can't be solved: hitting the time limit is truncation
+        truncated = self._step >= self.episode_len
+        return obs, reward, False, truncated, {"is_success": False}
+
+    def render(self):
+        return np.zeros((self.img_h, self.img_w, 3), dtype=np.uint8)
 
     def _obs(self):
         return {
             "qpos": np.random.randn(self.state_dim).astype(np.float32),
-            "image": np.random.rand(
-                self.num_cam, 3, self.img_h, self.img_w
-            ).astype(np.float32),
+            "image": np.random.rand(self.num_cam, 3, self.img_h, self.img_w).astype(np.float32),
         }

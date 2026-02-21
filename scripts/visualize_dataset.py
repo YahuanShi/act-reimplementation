@@ -20,6 +20,16 @@ import torch
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 
+def _episode_index(ds: LeRobotDataset) -> np.ndarray:
+    """Episode index of every frame (column access, no per-row decoding)."""
+    return np.asarray(ds.hf_dataset["episode_index"])
+
+
+def _load_actions(ds: LeRobotDataset, action_key: str) -> torch.Tensor:
+    """All actions as an (N, action_dim) tensor via one column read."""
+    return torch.tensor(np.array(ds.hf_dataset[action_key]), dtype=torch.float32)
+
+
 def plot_action_distributions(actions: torch.Tensor, output_dir: str):
     """Plot per-dimension action histograms.
 
@@ -66,9 +76,8 @@ def plot_action_distributions(actions: torch.Tensor, output_dir: str):
 def plot_episode_lengths(ds: LeRobotDataset, output_dir: str):
     """Plot the distribution of episode lengths (in frames).
 
-    LeRobot stores a flat list of frames for all episodes. episode_data_index
-    holds the [from, to) frame indices for each episode — this is how the dataset
-    knows which frames belong to which episode without storing episode IDs per frame.
+    LeRobot stores a flat list of frames for all episodes, each tagged with its
+    episode_index column, so counting frames per episode_index gives the lengths.
 
     Why this matters:
     - High variance in episode length affects chunk boundary handling (shorter
@@ -76,10 +85,8 @@ def plot_episode_lengths(ds: LeRobotDataset, output_dir: str):
     - Very short episodes (<< chunk_size) are wasted data because the action
       chunk extends past the episode end and must be padded with is_pad=True.
     """
-    lengths = [
-        ds.episode_data_index["to"][i].item() - ds.episode_data_index["from"][i].item()
-        for i in range(ds.num_episodes)
-    ]
+    _, lengths = np.unique(_episode_index(ds), return_counts=True)
+    lengths = lengths.tolist()
     fig, ax = plt.subplots(figsize=(8, 4))
     ax.hist(lengths, bins=min(30, ds.num_episodes), color="darkorange", alpha=0.8)
     ax.set_xlabel("Episode length (frames)")
@@ -106,12 +113,8 @@ def plot_sample_trajectory(ds: LeRobotDataset, action_key: str, output_dir: str)
       capacity and may need to be removed from action_dim).
     - Understanding the temporal structure: periodic motion, ramp-up/down, etc.
     """
-    ep_start = ds.episode_data_index["from"][0].item()
-    ep_end = ds.episode_data_index["to"][0].item()
-    actions = torch.stack(
-        [torch.tensor(ds.hf_dataset[i][action_key]) for i in range(ep_start, ep_end)]
-    )
-    actions_np = actions.numpy()
+    ep_index = _episode_index(ds)
+    actions_np = _load_actions(ds, action_key).numpy()[ep_index == ep_index[0]]
     T, n_dims = actions_np.shape
 
     fig, ax = plt.subplots(figsize=(12, 4))
@@ -135,9 +138,7 @@ def print_summary(ds: LeRobotDataset, action_key: str):
     more appropriate. A large range with moderate std suggests min-max;
     a Gaussian-looking range suggests z-score normalization.
     """
-    actions = torch.tensor(
-        np.stack([ds.hf_dataset[i][action_key] for i in range(len(ds.hf_dataset))])
-    )
+    actions = _load_actions(ds, action_key)
     print(f"  fps:          {ds.fps}")
     print(f"  episodes:     {ds.num_episodes}")
     print(f"  total frames: {len(ds.hf_dataset)}")
@@ -164,9 +165,7 @@ def main():
     print_summary(ds, args.action_key)
 
     print("\nGenerating plots ...")
-    actions = torch.tensor(
-        np.stack([ds.hf_dataset[i][args.action_key] for i in range(len(ds.hf_dataset))])
-    )
+    actions = _load_actions(ds, args.action_key)
     plot_action_distributions(actions, args.output_dir)
     plot_episode_lengths(ds, args.output_dir)
     plot_sample_trajectory(ds, args.action_key, args.output_dir)
