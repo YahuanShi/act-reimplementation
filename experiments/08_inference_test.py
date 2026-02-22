@@ -8,9 +8,10 @@ Tests temporal ensembling and the inference pipeline:
 """
 
 import torch
-from act.policy.act_policy import ACTPolicy
+
 from act.dataset.normalizer import ACTNormalizer
-from inference.temporal_ensemble import TemporalEnsemble, InferencePipeline
+from act.policy.act_policy import ACTPolicy
+from inference.temporal_ensemble import InferencePipeline, TemporalEnsemble
 
 
 def test_temporal_ensemble_basic():
@@ -69,7 +70,7 @@ def test_temporal_ensemble_smoothing():
         actions = torch.ones(chunk_size, action_dim) * val
         # Add some variation per step within the chunk
         for s in range(chunk_size):
-            actions[s] *= (1.0 + 0.1 * s)
+            actions[s] *= 1.0 + 0.1 * s
         ensemble.add_prediction(t, actions)
 
     # Collect ensembled actions
@@ -79,8 +80,10 @@ def test_temporal_ensemble_smoothing():
         ensembled_actions.append(action[0].item())
 
     # Compute step-to-step differences
-    diffs = [abs(ensembled_actions[i+1] - ensembled_actions[i])
-             for i in range(len(ensembled_actions)-1)]
+    diffs = [
+        abs(ensembled_actions[i + 1] - ensembled_actions[i])
+        for i in range(len(ensembled_actions) - 1)
+    ]
     avg_diff = sum(diffs) / len(diffs)
 
     print(f"  Ensembled actions: {[f'{a:.3f}' for a in ensembled_actions[:5]]}")
@@ -99,12 +102,19 @@ def test_inference_pipeline():
     print("=" * 60)
 
     config = {
-        'state_dim': 7, 'action_dim': 7,
-        'hidden_dim': 128, 'dim_feedforward': 256,
-        'backbone': 'resnet18', 'lr_backbone': 0,
-        'enc_layers': 2, 'dec_layers': 2, 'nheads': 4,
-        'num_queries': 10, 'camera_names': ['cam'],
-        'lr': 1e-4, 'kl_weight': 10.0,
+        "state_dim": 7,
+        "action_dim": 7,
+        "hidden_dim": 128,
+        "dim_feedforward": 256,
+        "backbone": "resnet18",
+        "lr_backbone": 0,
+        "enc_layers": 2,
+        "dec_layers": 2,
+        "nheads": 4,
+        "num_queries": 10,
+        "camera_names": ["cam"],
+        "lr": 1e-4,
+        "kl_weight": 10.0,
     }
 
     policy = ACTPolicy(config)
@@ -113,7 +123,8 @@ def test_inference_pipeline():
 
     # Test without temporal ensembling
     pipeline_no_agg = InferencePipeline(
-        policy, normalizer, chunk_size=10, temporal_agg=False, max_timesteps=50)
+        policy, normalizer, chunk_size=10, temporal_agg=False, max_timesteps=50
+    )
     pipeline_no_agg.reset()
 
     actions_no_agg = []
@@ -128,7 +139,8 @@ def test_inference_pipeline():
 
     # Test with temporal ensembling
     pipeline_agg = InferencePipeline(
-        policy, normalizer, chunk_size=10, temporal_agg=True, max_timesteps=50)
+        policy, normalizer, chunk_size=10, temporal_agg=True, max_timesteps=50
+    )
     pipeline_agg.reset()
 
     actions_agg = []

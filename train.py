@@ -26,12 +26,41 @@ Output files (in --ckpt_dir):
 
 import argparse
 
-import numpy as np
+import torch
 from torch.utils.data import DataLoader, Subset
 
 from act.dataset.lerobot_wrapper import LeRobotACTDataset
 from act.dataset.normalizer import ACTNormalizer
 from training.workspace import TrainWorkspace
+
+
+def split_by_episode(episode_indices, val_ratio, seed):
+    """
+    Split frame indices into train/val sets by whole episodes.
+
+    Frames within one demonstration are near-duplicates of each other, so a
+    frame-level random split puts almost-identical frames on both sides and
+    makes the validation loss (and thus policy_best.ckpt selection) overly
+    optimistic. Holding out entire episodes measures generalisation to unseen
+    demonstrations instead.
+
+    Returns:
+        (train_frame_indices, val_frame_indices, val_episode_ids)
+    """
+    episodes = sorted(set(episode_indices))
+    if len(episodes) < 2:
+        raise ValueError(
+            f"Need at least 2 episodes for an episode-level train/val split, got {len(episodes)}"
+        )
+    g = torch.Generator().manual_seed(seed)
+    perm = torch.randperm(len(episodes), generator=g).tolist()
+    n_val = min(len(episodes) - 1, max(1, round(len(episodes) * val_ratio)))
+    val_episodes = sorted(episodes[i] for i in perm[:n_val])
+
+    val_set = set(val_episodes)
+    train_idx = [i for i, ep in enumerate(episode_indices) if ep not in val_set]
+    val_idx = [i for i, ep in enumerate(episode_indices) if ep in val_set]
+    return train_idx, val_idx, val_episodes
 
 
 def main(args):
@@ -41,7 +70,7 @@ def main(args):
         repo_id=args.dataset,
         root=args.data_root,
         chunk_size=args.chunk_size,
-        episodes=None,
+        episodes=args.episodes,
     )
     print(f"  Samples:    {len(dataset)}")
     print(f"  State dim:  {dataset.state_dim}")
@@ -52,21 +81,22 @@ def main(args):
     # Split whole episodes, not frames: neighbouring frames are nearly identical,
     # so a per-frame split puts near-copies of training samples into val and
     # makes val loss (and the policy_best.ckpt choice) misleadingly optimistic.
-    ep_of_sample = dataset.episode_indices()
-    episodes = np.unique(ep_of_sample)
-    n_val_eps = max(1, int(round(len(episodes) * args.val_ratio)))
-    assert n_val_eps < len(episodes), "Need at least 2 episodes for a train/val split"
-    rng = np.random.default_rng(args.seed)
-    val_eps = rng.choice(episodes, size=n_val_eps, replace=False)
-    is_val = np.isin(ep_of_sample, val_eps)
-    train_ds = Subset(dataset, np.flatnonzero(~is_val).tolist())
-    val_ds = Subset(dataset, np.flatnonzero(is_val).tolist())
+    train_idx, val_idx, val_episodes = split_by_episode(
+        dataset.episode_indices, args.val_ratio, args.seed
+    )
+    train_ds = Subset(dataset, train_idx)
+    val_ds = Subset(dataset, val_idx)
+    n_eps = len(set(dataset.episode_indices))
     print(
-        f"  Episodes: {len(episodes) - n_val_eps} train / {n_val_eps} val (val: {sorted(val_eps.tolist())})"
+        f"  Episodes: {n_eps - len(val_episodes)} train / {len(val_episodes)} val (val: {val_episodes})"
     )
     print(f"  Samples:  {len(train_ds)} train / {len(val_ds)} val")
     steps_per_epoch = -(-len(train_ds) // args.batch_size)
     print(f"  Steps:    {steps_per_epoch}/epoch, {steps_per_epoch * args.epochs} total")
+
+    # Image resolution and control rate the policy is trained on — saved to
+    # config.json so inference.py can reproduce the exact preprocessing.
+    _, _, img_h, img_w = dataset[0]["image"].shape
 
     train_loader = DataLoader(
         train_ds,
@@ -94,13 +124,9 @@ def main(args):
     print(f"  Action mean: {normalizer.action_mean[:4]}...")
     print(f"  Action std:  {normalizer.action_std[:4]}...")
 
-    # ── Augmentation ──
-    crop_size = None
     if args.crop_ratio < 1.0:
-        # (num_cam, 3, H, W) -> crop H, W by crop_ratio
-        h, w = dataset[0]["image"].shape[-2:]
-        crop_size = [int(h * args.crop_ratio), int(w * args.crop_ratio)]
-        print(f"  Random crop: {h}x{w} -> {crop_size[0]}x{crop_size[1]} (center crop at eval)")
+        ch, cw = round(img_h * args.crop_ratio), round(img_w * args.crop_ratio)
+        print(f"  Random crop: {img_h}x{img_w} -> {ch}x{cw} (center crop at eval)")
 
     # ── Config ──
     config = {
@@ -120,8 +146,13 @@ def main(args):
         "num_queries": args.chunk_size,
         "camera_names": dataset.image_keys,
         "kl_weight": args.kl_weight,
-        "crop_size": crop_size,
+        # Augmentation (random crop + color jitter in train, center crop in eval)
+        "crop_ratio": args.crop_ratio,
         "color_jitter": args.color_jitter,
+        # Data properties (consumed by inference.py consistency checks)
+        "image_hw": [img_h, img_w],
+        "fps": dataset.fps,
+        "val_episodes": val_episodes,
         # Training
         "lr": args.lr,
         "num_epochs": args.epochs,
@@ -158,7 +189,16 @@ if __name__ == "__main__":
     # Dataset
     parser.add_argument("--dataset", type=str, required=True, help="LeRobot dataset repo_id")
     parser.add_argument("--data_root", type=str, default=None, help="Local dataset root directory")
-    parser.add_argument("--val_ratio", type=float, default=0.1)
+    parser.add_argument(
+        "--episodes",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Only use these episode indices (default: all) — handy for quick debug runs",
+    )
+    parser.add_argument(
+        "--val_ratio", type=float, default=0.1, help="Fraction of EPISODES held out for validation"
+    )
 
     # Model architecture
     parser.add_argument(

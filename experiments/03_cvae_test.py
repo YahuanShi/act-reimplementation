@@ -9,6 +9,7 @@ Tests the CVAE encoder components of DETRVAE:
 """
 
 import torch
+
 from act.model.detr_vae import build_act_model, kl_divergence, reparametrize
 
 
@@ -19,11 +20,17 @@ def test_cvae_latent():
     print("=" * 60)
 
     config = {
-        'state_dim': 7, 'action_dim': 7,
-        'hidden_dim': 256, 'dim_feedforward': 1024,
-        'backbone': 'resnet18', 'lr_backbone': 1e-5,
-        'enc_layers': 4, 'dec_layers': 4, 'nheads': 8,
-        'num_queries': 50, 'camera_names': ['cam'],
+        "state_dim": 7,
+        "action_dim": 7,
+        "hidden_dim": 256,
+        "dim_feedforward": 1024,
+        "backbone": "resnet18",
+        "lr_backbone": 1e-5,
+        "enc_layers": 4,
+        "dec_layers": 4,
+        "nheads": 8,
+        "num_queries": 50,
+        "camera_names": ["cam"],
     }
     model = build_act_model(config)
 
@@ -97,11 +104,17 @@ def test_inference_prior():
     print("=" * 60)
 
     config = {
-        'state_dim': 7, 'action_dim': 7,
-        'hidden_dim': 256, 'dim_feedforward': 1024,
-        'backbone': 'resnet18', 'lr_backbone': 1e-5,
-        'enc_layers': 4, 'dec_layers': 4, 'nheads': 8,
-        'num_queries': 50, 'camera_names': ['cam'],
+        "state_dim": 7,
+        "action_dim": 7,
+        "hidden_dim": 256,
+        "dim_feedforward": 1024,
+        "backbone": "resnet18",
+        "lr_backbone": 1e-5,
+        "enc_layers": 4,
+        "dec_layers": 4,
+        "nheads": 8,
+        "num_queries": 50,
+        "camera_names": ["cam"],
     }
     model = build_act_model(config)
     model.eval()

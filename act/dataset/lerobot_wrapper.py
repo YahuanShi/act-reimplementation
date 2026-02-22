@@ -31,7 +31,6 @@ Output format per sample:
   }
 """
 
-import numpy as np
 import torch
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from torch.utils.data import Dataset
@@ -155,20 +154,25 @@ class LeRobotACTDataset(Dataset):
         action = item[self.action_key]
         out["action"] = action
 
-        # LeRobot marks the clamped (beyond-episode) timesteps of every
-        # delta_timestamps key with a '<key>_is_pad' boolean mask.
-        out["is_pad"] = item[f"{self.action_key}_is_pad"]
+        # is_pad mask: LeRobot already computes it while resolving
+        # delta_timestamps — every future timestamp that falls past the end of
+        # the episode is clamped to the last frame and flagged in
+        # '{action_key}_is_pad'. Re-deriving it by scanning hf_dataset rows
+        # would cost up to chunk_size extra row reads per sample.
+        out["is_pad"] = item[f"{self.action_key}_is_pad"].bool()
 
         return out
 
+    @property
     def episode_indices(self):
         """
-        Episode index of every sample, as a numpy array of length len(self).
+        Episode index of every sample, as a list aligned with __getitem__.
 
-        Used to split train/val by episode: neighbouring frames are almost
-        identical, so a random per-frame split leaks training data into val.
+        Used to build train/val splits at the episode level: frames of the
+        same demonstration are highly correlated, so a frame-level random
+        split would leak near-duplicates of training frames into validation.
         """
-        return np.asarray(self.ds.hf_dataset["episode_index"])
+        return [int(e) for e in self.ds.hf_dataset["episode_index"]]
 
     @property
     def state_dim(self):

@@ -9,17 +9,25 @@ Tests the ACTPolicy wrapper to verify:
 """
 
 import torch
+
 from act.policy.act_policy import ACTPolicy
 
 
 def make_policy_config():
     return {
-        'state_dim': 7, 'action_dim': 7,
-        'hidden_dim': 256, 'dim_feedforward': 1024,
-        'backbone': 'resnet18', 'lr_backbone': 1e-5,
-        'enc_layers': 4, 'dec_layers': 4, 'nheads': 8,
-        'num_queries': 50, 'camera_names': ['cam'],
-        'lr': 1e-4, 'kl_weight': 10.0,
+        "state_dim": 7,
+        "action_dim": 7,
+        "hidden_dim": 256,
+        "dim_feedforward": 1024,
+        "backbone": "resnet18",
+        "lr_backbone": 1e-5,
+        "enc_layers": 4,
+        "dec_layers": 4,
+        "nheads": 8,
+        "num_queries": 50,
+        "camera_names": ["cam"],
+        "lr": 1e-4,
+        "kl_weight": 10.0,
     }
 
 
@@ -43,10 +51,10 @@ def test_compute_loss():
     print(f"  kl:   {loss_dict['kl'].item():.4f}")
     print(f"  loss: {loss_dict['loss'].item():.4f}")
 
-    assert 'l1' in loss_dict and 'kl' in loss_dict and 'loss' in loss_dict
-    assert loss_dict['loss'].item() > 0, "Loss should be positive"
-    assert loss_dict['l1'].item() > 0, "L1 should be positive"
-    assert loss_dict['kl'].item() >= 0, "KL should be non-negative"
+    assert "l1" in loss_dict and "kl" in loss_dict and "loss" in loss_dict
+    assert loss_dict["loss"].item() > 0, "Loss should be positive"
+    assert loss_dict["l1"].item() > 0, "L1 should be positive"
+    assert loss_dict["kl"].item() >= 0, "KL should be non-negative"
 
     print("  PASSED\n")
 
@@ -88,8 +96,8 @@ def test_optimizer():
     print(f"  Group 1 lr (backbone): {optimizer.param_groups[1]['lr']}")
 
     assert len(optimizer.param_groups) == 2
-    assert optimizer.param_groups[0]['lr'] == 1e-4
-    assert optimizer.param_groups[1]['lr'] == 1e-5
+    assert optimizer.param_groups[0]["lr"] == 1e-4
+    assert optimizer.param_groups[1]["lr"] == 1e-5
 
     print("  PASSED\n")
 
@@ -111,22 +119,21 @@ def test_loss_decreases():
 
     # First forward pass
     loss_dict_1 = policy.compute_loss(qpos, image, actions, is_pad)
-    loss_1 = loss_dict_1['loss']
+    loss_1 = loss_dict_1["loss"]
     loss_1.backward()
     optimizer.step()
     optimizer.zero_grad()
 
     # Second forward pass
     loss_dict_2 = policy.compute_loss(qpos, image, actions, is_pad)
-    loss_2 = loss_dict_2['loss']
+    loss_2 = loss_dict_2["loss"]
 
     print(f"  Loss before: {loss_1.item():.4f}")
     print(f"  Loss after:  {loss_2.item():.4f}")
     print(f"  Decreased: {loss_2.item() < loss_1.item()}")
 
     # Loss should decrease on the same batch (overfitting test)
-    assert loss_2.item() < loss_1.item(), \
-        "Loss should decrease after one step on the same batch"
+    assert loss_2.item() < loss_1.item(), "Loss should decrease after one step on the same batch"
 
     print("  PASSED\n")
 

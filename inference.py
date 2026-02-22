@@ -13,21 +13,34 @@ Action format (7-DOF single arm):
 For dual-arm (ALOHA-style, action_dim=14), set --no_gripper and handle
 arm routing in your own wrapper around this script.
 
+Consistency with training (read from config.json written by train.py):
+    - image resolution  : frames are centre-cropped/resized to config["image_hw"]
+    - control frequency : defaults to the dataset fps, warns on mismatch
+    - camera order      : follows config["camera_names"], fails if a camera is missing
+    - qpos range        : warns if the robot state is far outside the training stats
+
 Usage:
-    # Dry run (no robot commands sent — use for sanity check)
+    # Dry run (robot is not moved at all — use for sanity check)
     python inference.py --ckpt_dir checkpoints --robot_ip 192.168.1.1 --dry_run
 
     # Real inference, temporal ensembling enabled
     python inference.py --ckpt_dir checkpoints --robot_ip 192.168.1.1 \\
-        --temporal_agg --frequency 50 --max_steps 400
+        --temporal_agg --max_steps 400
 
     # Two cameras
     python inference.py --ckpt_dir checkpoints --robot_ip 192.168.1.1 \\
         --cam_exterior 105422061000 --cam_wrist 352122273671
+
+    # Real-robot evaluation: 20 rollouts, operator labels success, videos saved,
+    # summary written to <ckpt_dir>/eval_<timestamp>.json
+    python inference.py --ckpt_dir checkpoints --robot_ip 192.168.1.1 \\
+        --temporal_agg --num_episodes 20 --record_dir eval_videos
 """
 
 import argparse
+import json
 import logging
+import os
 import threading
 import time
 
@@ -53,7 +66,7 @@ CAM_SERIAL_EXTERIOR = "105422061000"
 CAM_SERIAL_WRIST = "352122273671"
 IMAGE_SIZE = 480  # square crop/resize target
 
-HOME_DEG = [0.0, -90.0, 0.0, -90.0, 0.0, 0.0]
+HOME_DEG = [45, -20, -140, -40, -270, 0]
 HOME_RAD = np.radians(HOME_DEG).astype(np.float32)
 
 SERVO_J_TIME = 0.1  # RTDE servoJ lookahead time [s]
@@ -195,13 +208,26 @@ class WeissCRGGripper:
 # ══════════════════════════════════════════════════════════════════════
 
 
-def _center_crop_resize(bgr: np.ndarray, size: int = IMAGE_SIZE) -> np.ndarray:
-    """Square centre-crop + resize, BGR→RGB."""
+def _center_crop_resize(
+    bgr: np.ndarray, out_hw: tuple[int, int] = (IMAGE_SIZE, IMAGE_SIZE)
+) -> np.ndarray:
+    """
+    Centre-crop to the target aspect ratio, resize to out_hw, BGR→RGB.
+
+    out_hw should be the image resolution the policy was trained on
+    (config["image_hw"]); for a square target this is the usual square
+    centre crop, for e.g. 480x640 it keeps the full frame.
+    """
     h, w = bgr.shape[:2]
-    s = min(h, w)
-    y0, x0 = (h - s) // 2, (w - s) // 2
-    crop = bgr[y0 : y0 + s, x0 : x0 + s]
-    resized = cv2.resize(crop, (size, size), interpolation=cv2.INTER_LINEAR)
+    out_h, out_w = out_hw
+    target_ratio = out_w / out_h
+    if w / h > target_ratio:  # too wide → crop width
+        cw, ch = int(round(h * target_ratio)), h
+    else:  # too tall → crop height
+        cw, ch = w, int(round(w / target_ratio))
+    y0, x0 = (h - ch) // 2, (w - cw) // 2
+    crop = bgr[y0 : y0 + ch, x0 : x0 + cw]
+    resized = cv2.resize(crop, (out_w, out_h), interpolation=cv2.INTER_AREA)
     return cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
 
 
@@ -245,7 +271,7 @@ class URRobot:
         use_gripper: whether to connect the Weiss gripper
         cam_serial_exterior: RealSense serial for exterior camera (None to skip)
         cam_serial_wrist: RealSense serial for wrist camera (None to skip)
-        image_size: square output size for camera frames [px]
+        image_hw: (height, width) of camera frames fed to the policy [px]
     """
 
     def __init__(
@@ -255,13 +281,13 @@ class URRobot:
         use_gripper: bool = True,
         cam_serial_exterior: str = CAM_SERIAL_EXTERIOR,
         cam_serial_wrist: str = None,
-        image_size: int = IMAGE_SIZE,
+        image_hw: tuple[int, int] = (IMAGE_SIZE, IMAGE_SIZE),
     ):
         import rtde_control
         import rtde_receive
 
         self._dt = 1.0 / frequency
-        self._image_size = image_size
+        self._image_hw = tuple(image_hw)
 
         log.info(f"[URRobot] connecting to {robot_ip}...")
         self._rtde_r = rtde_receive.RTDEReceiveInterface(robot_ip)
@@ -316,7 +342,7 @@ class URRobot:
         images = {}
         for name, pipe in self._cameras.items():
             bgr = _grab_frame(pipe)
-            images[name] = _center_crop_resize(bgr, self._image_size)
+            images[name] = _center_crop_resize(bgr, self._image_hw)
 
         return {"qpos": qpos, "images": images}
 
@@ -353,6 +379,13 @@ class URRobot:
                 self._gripper.move_to_pos(mm)
                 self._last_gripper_open = want_open
                 log.info(f"[URRobot] gripper {'opening' if want_open else 'closing'}")
+
+    def hold(self) -> None:
+        """Stop servoing and hold the current pose (between evaluation episodes)."""
+        try:
+            self._rtde_c.servoStop()
+        except Exception as e:
+            log.warning(f"[URRobot] servoStop error: {e}")
 
     def stop(self) -> None:
         try:
@@ -399,30 +432,85 @@ def build_image_tensor(obs: dict, cam_order: list[str]) -> torch.Tensor:
 # ══════════════════════════════════════════════════════════════════════
 
 
+def _draw_action_bars(action: np.ndarray, height: int, width: int = 200) -> np.ndarray:
+    """
+    Sidebar panel with one horizontal bar per action dimension.
+
+    Bar length is proportional to |value|, normalised by the max absolute value
+    across all dims so the widest bar fills the panel. Green = positive, red = negative
+    (BGR convention). Useful for quickly spotting which joints are saturated or reversed.
+    """
+    panel = np.zeros((height, width, 3), dtype=np.uint8)
+    n = len(action)
+    row_h = max(10, (height - 24) // max(n, 1))
+    bar_max = float(np.abs(action).max()) or 1.0  # avoid divide-by-zero for zero actions
+    bar_area = width - 64  # pixels reserved for the value bars (label takes the rest)
+
+    cv2.putText(
+        panel, "Actions", (4, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 180, 180), 1, cv2.LINE_AA
+    )
+
+    for i, val in enumerate(action):
+        y0 = 20 + i * row_h
+        bar_px = int(abs(val) / bar_max * bar_area)
+        color = (60, 200, 60) if val >= 0 else (60, 60, 220)  # BGR: green / red
+        if bar_px > 0:
+            cv2.rectangle(panel, (52, y0 + 2), (52 + bar_px, y0 + row_h - 3), color, -1)
+        label = f"a{i}:{val:+.2f}"
+        cv2.putText(
+            panel,
+            label,
+            (2, y0 + row_h - 4),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.36,
+            (210, 210, 210),
+            1,
+            cv2.LINE_AA,
+        )
+
+    return panel
+
+
 def make_vis_frame(
-    obs: dict, action: np.ndarray, step: int, inference_ms: float, temporal_agg: bool
+    obs: dict,
+    action: np.ndarray,
+    step: int,
+    inference_ms: float,
+    temporal_agg: bool,
+    chunk_size: int = 1,
+    chunk_step: int = 0,
+    ensemble_depth: int = 0,
 ) -> np.ndarray:
     """
-    Side-by-side camera view with status overlay.
-    Shows all cameras tiled horizontally; displays step, latency, gripper state.
+    Side-by-side camera view with status overlay + action bars sidebar.
+
+    Camera panels are tiled horizontally at 320 px height (aspect preserved).
+    The action bars sidebar (right) shows per-joint magnitudes at a glance —
+    handy for spotting saturated or reversed joints without reading numbers.
     """
     disp = 320
     panels = []
     for name in sorted(obs["images"]):
         rgb = obs["images"][name]
         bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-        panels.append(cv2.resize(bgr, (disp, disp)))
+        h, w = bgr.shape[:2]
+        panels.append(cv2.resize(bgr, (int(round(disp * w / h)), disp)))
     frame = np.concatenate(panels, axis=1)
 
     gripper_str = ""
     if len(action) > 6:
         gripper_str = f"  Grip: {'open' if action[6] < 0.5 else 'close'}"
 
+    if temporal_agg:
+        mode_str = f"ensemble (depth {ensemble_depth})"
+    else:
+        mode_str = f"chunk {chunk_step + 1}/{chunk_size}"
+
     lines = [
         f"Step: {step}",
         f"Infer: {inference_ms:.0f} ms",
-        f"Mode: {'ensemble' if temporal_agg else 'chunk'}" + gripper_str,
-        "q / ESC — stop",
+        f"Mode: {mode_str}" + gripper_str,
+        "q / ESC - end episode",
     ]
     for i, txt in enumerate(lines):
         cv2.putText(
@@ -435,7 +523,10 @@ def make_vis_frame(
             1,
             cv2.LINE_AA,
         )
-    return frame
+
+    # Action bars panel appended to the right of camera tiles
+    bars = _draw_action_bars(action, height=disp)
+    return np.concatenate([frame, bars], axis=1)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -443,7 +534,55 @@ def make_vis_frame(
 # ══════════════════════════════════════════════════════════════════════
 
 
-def run_inference(
+def resolve_camera_order(camera_names: list[str], available: list[str]) -> list[str]:
+    """
+    Map the model's camera names (dataset image keys) to robot camera names.
+
+    The model expects cameras in the order of config["camera_names"], e.g.
+    ["observation.images.exterior", "observation.images.wrist"]. The robot
+    names its cameras by the last key segment ("exterior", "wrist"), so we
+    match on that — silently stacking cameras in a different order than in
+    training would feed the wrong view into each image slot.
+
+    Raises:
+        ValueError if a camera the model needs is not connected.
+    """
+    order = [name.rsplit(".", 1)[-1] for name in camera_names]
+    missing = [c for c in order if c not in available]
+    if missing:
+        raise ValueError(
+            f"Model expects cameras {order} (from {camera_names}) but only {available} "
+            f"are connected. Missing: {missing}. Check --cam_exterior / --cam_wrist."
+        )
+    return order
+
+
+def check_qpos_in_distribution(qpos: np.ndarray, normalizer, z_thresh: float = 5.0) -> None:
+    """
+    Warn if the robot's current state is far outside the training distribution.
+
+    Catches unit / convention mismatches between data collection and
+    deployment before the policy moves the arm — e.g. degrees vs radians,
+    gripper width in mm vs a 0/1 flag, or a home pose never seen in the data.
+    """
+    if normalizer.qpos_mean is None:
+        return
+    mean = normalizer.qpos_mean.numpy()
+    std = normalizer.qpos_std.numpy()
+    q = qpos[: len(mean)]
+    z = (q - mean) / std
+    bad = np.where(np.abs(z) > z_thresh)[0]
+    if len(bad) == 0:
+        log.info(f"qpos check OK — max |z| = {np.abs(z).max():.2f}")
+        return
+    for i in bad:
+        log.warning(
+            f"qpos[{i}] = {q[i]:.3f} is {z[i]:+.1f} std from the training mean "
+            f"({mean[i]:.3f} ± {std[i]:.3f}) — check units / gripper convention / home pose"
+        )
+
+
+def run_episode(
     pipeline,
     robot: URRobot,
     config: dict,
@@ -452,14 +591,20 @@ def run_inference(
     max_steps: int = 400,
     temporal_agg: bool = False,
     dry_run: bool = False,
-) -> None:
+    no_vis: bool = False,
+    record: bool = False,
+) -> tuple[int, list[np.ndarray]]:
     """
-    ACT inference loop.
+    Run one ACT inference episode on the robot.
 
     ACT only needs the *current* observation (no history window).
     The InferencePipeline handles action-chunk re-querying internally:
       - temporal_agg=False: re-queries every chunk_size steps
       - temporal_agg=True:  queries every step, smooths with exp weighting
+
+    The episode ends after max_steps or when the operator presses q / ESC in
+    the visualisation window. Ctrl+C propagates to the caller (abort all).
+    The robot is NOT stopped here so that main() can run several episodes.
 
     Args:
         pipeline: InferencePipeline from eval.load_policy()
@@ -470,76 +615,101 @@ def run_inference(
         max_steps: episode length cap
         temporal_agg: whether temporal ensembling is active (for display)
         dry_run: if True, skips robot.apply_action()
+        no_vis: if True, disables cv2 display (for headless / SSH deployments)
+        record: if True, collect visualisation frames for a video
+
+    Returns:
+        (steps executed, recorded frames)
     """
     dt = 1.0 / frequency
     state_dim = config["state_dim"]
+    chunk_size = pipeline.chunk_size
+    frames = []
 
-    # ── Camera warmup ──
-    log.info("Warming up cameras...")
-    for _ in range(5):
-        robot.get_obs()
-        time.sleep(0.05)
-
-    # ── CUDA warmup — trigger JIT compilation before the timed loop ──
-    log.info("Warming up inference...")
-    dummy_qpos = torch.zeros(state_dim)
-    dummy_image = torch.zeros(len(cam_order), 3, IMAGE_SIZE, IMAGE_SIZE)
     pipeline.reset()
-    pipeline.get_action(0, dummy_qpos, dummy_image)
-    pipeline.reset()
-
     log.info(
-        f"Ready — freq={frequency} Hz  max_steps={max_steps}  "
+        f"Episode start — freq={frequency} Hz  max_steps={max_steps}  "
         f"temporal_agg={temporal_agg}  dry_run={dry_run}"
     )
 
     step = 0
-    time.monotonic()
+    while step < max_steps:
+        t_step_start = time.monotonic()
 
-    try:
-        while step < max_steps:
-            t_step_start = time.monotonic()
+        # ── Observe ──
+        obs = robot.get_obs()
+        qpos = torch.tensor(obs["qpos"][:state_dim], dtype=torch.float32)
+        image = build_image_tensor(obs, cam_order)
 
-            # ── Observe ──
-            obs = robot.get_obs()
-            qpos = torch.tensor(obs["qpos"][:state_dim], dtype=torch.float32)
-            image = build_image_tensor(obs, cam_order)
+        # ── Inference ──
+        t_inf = time.monotonic()
+        action_t = pipeline.get_action(step, qpos, image)
+        inference_ms = (time.monotonic() - t_inf) * 1000
+        action_np = action_t.cpu().numpy()
 
-            # ── Inference ──
-            t_inf = time.monotonic()
-            action_t = pipeline.get_action(step, qpos, image)
-            inference_ms = (time.monotonic() - t_inf) * 1000
-            action_np = action_t.cpu().numpy()
+        log.debug(
+            f"step {step:>4}:  infer={inference_ms:.0f} ms  "
+            f"action=[{' '.join(f'{a:.3f}' for a in action_np[:4])} ...]"
+        )
+        if inference_ms > dt * 1000:
+            log.warning(f"step {step}: inference {inference_ms:.0f} ms exceeds {dt * 1000:.0f} ms")
 
-            log.info(
-                f"step {step:>4}:  infer={inference_ms:.0f} ms  "
-                f"action=[{' '.join(f'{a:.3f}' for a in action_np[:4])} ...]"
-            )
-
-            # ── Execute ──
-            if not dry_run:
-                robot.apply_action(action_np)
-
-            # ── Visualise ──
-            cv2.imshow(
-                "ACT Inference", make_vis_frame(obs, action_np, step, inference_ms, temporal_agg)
-            )
-            key = cv2.pollKey()
-            if key in (ord("q"), 27):  # q or ESC
-                raise KeyboardInterrupt
-
-            step += 1
-
-            # ── Hold loop timing ──
-            precise_wait(t_step_start + dt)
-
-    except KeyboardInterrupt:
-        log.info("Stopped by user.")
-    finally:
-        cv2.destroyAllWindows()
+        # ── Execute ──
         if not dry_run:
-            robot.stop()
-        log.info(f"Inference ended at step {step}.")
+            robot.apply_action(action_np)
+
+        # ── Visualise / record ──
+        if not no_vis or record:
+            # ensemble_depth: how many overlapping predictions cover this step
+            # (saturates at chunk_size once the buffer is full)
+            ensemble_depth = min(step + 1, chunk_size) if temporal_agg else 0
+            frame = make_vis_frame(
+                obs,
+                action_np,
+                step,
+                inference_ms,
+                temporal_agg,
+                chunk_size=chunk_size,
+                chunk_step=step % chunk_size,
+                ensemble_depth=ensemble_depth,
+            )
+            if record:
+                frames.append(frame)
+            if not no_vis:
+                cv2.imshow("ACT Inference", frame)
+                key = cv2.pollKey()
+                if key in (ord("q"), 27):  # q or ESC — end this episode
+                    log.info("Episode ended by operator.")
+                    step += 1
+                    break
+
+        step += 1
+
+        # ── Hold loop timing ──
+        precise_wait(t_step_start + dt)
+
+    log.info(f"Episode ended at step {step}.")
+    return step, frames
+
+
+def save_video(frames: list[np.ndarray], path: str, fps: int) -> None:
+    """Write BGR frames to an mp4 file."""
+    if not frames:
+        return
+    h, w = frames[0].shape[:2]
+    writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+    for f in frames:
+        writer.write(f)
+    writer.release()
+    log.info(f"Saved video: {path}")
+
+
+def ask_operator(prompt: str, choices: str = "yn") -> str:
+    """Block until the operator types one of the given single-letter choices."""
+    while True:
+        ans = input(f"{prompt} [{'/'.join(choices)}]: ").strip().lower()
+        if ans in choices:
+            return ans
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -548,7 +718,7 @@ def run_inference(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="ACT real robot inference")
+    parser = argparse.ArgumentParser(description="ACT real robot inference / evaluation")
 
     # Policy
     parser.add_argument(
@@ -562,7 +732,12 @@ def main() -> None:
 
     # Robot
     parser.add_argument("--robot_ip", required=True, help="UR robot controller IP address")
-    parser.add_argument("--frequency", type=int, default=50, help="Control loop frequency [Hz]")
+    parser.add_argument(
+        "--frequency",
+        type=int,
+        default=None,
+        help="Control loop frequency [Hz] (default: dataset fps from config.json, else 50)",
+    )
     parser.add_argument("--max_steps", type=int, default=400)
     parser.add_argument("--no_gripper", action="store_true", help="Disable Weiss gripper")
 
@@ -576,12 +751,31 @@ def main() -> None:
         "--cam_wrist", default=None, help="RealSense serial number for wrist camera (optional)"
     )
     parser.add_argument(
-        "--image_size", type=int, default=IMAGE_SIZE, help="Square image size after crop/resize"
+        "--image_size",
+        type=int,
+        default=None,
+        help="Square image size override (default: training resolution from config.json)",
+    )
+
+    # Evaluation
+    parser.add_argument(
+        "--num_episodes",
+        type=int,
+        default=1,
+        help="Number of rollouts; with >1 the operator labels each one success/failure",
+    )
+    parser.add_argument(
+        "--record_dir", default=None, help="Save an mp4 of every episode into this directory"
     )
 
     # Misc
     parser.add_argument(
-        "--dry_run", action="store_true", help="Full pipeline without sending robot commands"
+        "--dry_run",
+        action="store_true",
+        help="Full pipeline without moving the robot (no homing, no servo commands)",
+    )
+    parser.add_argument(
+        "--no_vis", action="store_true", help="Disable cv2 display (headless / SSH deployments)"
     )
     args = parser.parse_args()
 
@@ -610,41 +804,126 @@ def main() -> None:
         f"chunk_size={config['num_queries']}  cameras={config['camera_names']}"
     )
 
-    # Determine camera order for image stacking
-    cam_order = []
-    if args.cam_exterior:
-        cam_order.append("exterior")
-    if args.cam_wrist:
-        cam_order.append("wrist")
-    if len(cam_order) != len(config["camera_names"]):
+    # ── Consistency with training data ──
+    # Control rate: actions are a time series sampled at the dataset fps;
+    # replaying them at another rate speeds up / slows down every motion.
+    train_fps = config.get("fps")
+    frequency = args.frequency or train_fps or 50
+    if train_fps is not None and frequency != train_fps:
         log.warning(
-            f"Model has {len(config['camera_names'])} cameras but "
-            f"{len(cam_order)} provided. Check --cam_exterior / --cam_wrist."
+            f"Control frequency {frequency} Hz differs from training data fps {train_fps} — "
+            f"the policy's motions will play back {frequency / train_fps:.2f}x faster"
         )
+
+    # Image resolution: must match what the policy saw in training
+    if args.image_size is not None:
+        image_hw = (args.image_size, args.image_size)
+        if config.get("image_hw") and list(image_hw) != list(config["image_hw"]):
+            log.warning(
+                f"--image_size {image_hw} overrides training resolution {config['image_hw']}"
+            )
+    elif config.get("image_hw"):
+        image_hw = tuple(config["image_hw"])
+    else:
+        log.warning(f"config.json has no image_hw, assuming {IMAGE_SIZE}x{IMAGE_SIZE}")
+        image_hw = (IMAGE_SIZE, IMAGE_SIZE)
+
+    # Camera order: follow config["camera_names"], not CLI order
+    available = (["exterior"] if args.cam_exterior else []) + (["wrist"] if args.cam_wrist else [])
+    cam_order = resolve_camera_order(config["camera_names"], available)
+    log.info(f"  camera order: {cam_order}  image_hw: {image_hw}  frequency: {frequency} Hz")
 
     # ── Connect robot ──
     log.info(f"Connecting to UR robot at {args.robot_ip} ...")
     robot = URRobot(
         robot_ip=args.robot_ip,
-        frequency=args.frequency,
+        frequency=frequency,
         use_gripper=not args.no_gripper,
         cam_serial_exterior=args.cam_exterior if args.cam_exterior else None,
         cam_serial_wrist=args.cam_wrist,
-        image_size=args.image_size,
+        image_hw=image_hw,
     )
 
-    robot.home()
+    if args.record_dir:
+        os.makedirs(args.record_dir, exist_ok=True)
+    evaluating = args.num_episodes > 1
+    results = []
 
-    run_inference(
-        pipeline=pipeline,
-        robot=robot,
-        config=config,
-        cam_order=cam_order,
-        frequency=args.frequency,
-        max_steps=args.max_steps,
-        temporal_agg=args.temporal_agg,
-        dry_run=args.dry_run,
-    )
+    try:
+        # ── Warmup: cameras + CUDA kernels before the timed loop ──
+        log.info("Warming up cameras and inference...")
+        for _ in range(5):
+            robot.get_obs()
+            time.sleep(0.05)
+        pipeline.get_action(
+            0,
+            torch.zeros(config["state_dim"]),
+            torch.zeros(len(cam_order), 3, *image_hw),
+        )
+
+        for ep in range(args.num_episodes):
+            if ep > 0 or evaluating:
+                input(f"\n[Episode {ep + 1}/{args.num_episodes}] Reset the scene, then press Enter")
+
+            if args.dry_run:
+                log.info("Dry run — skipping homing, robot stays where it is")
+            else:
+                robot.home()
+            check_qpos_in_distribution(robot.get_obs()["qpos"], pipeline.normalizer)
+
+            steps, frames = run_episode(
+                pipeline=pipeline,
+                robot=robot,
+                config=config,
+                cam_order=cam_order,
+                frequency=frequency,
+                max_steps=args.max_steps,
+                temporal_agg=args.temporal_agg,
+                dry_run=args.dry_run,
+                no_vis=args.no_vis,
+                record=args.record_dir is not None,
+            )
+            # Freeze the arm where it is before talking to the operator
+            if not args.dry_run:
+                robot.hold()
+
+            result = {"episode": ep, "steps": steps}
+            if evaluating:
+                result["success"] = ask_operator("Was the episode successful?") == "y"
+                n_ok = sum(r["success"] for r in results) + result["success"]
+                log.info(f"Success so far: {n_ok}/{ep + 1}")
+            if args.record_dir:
+                tag = "" if not evaluating else ("_success" if result["success"] else "_fail")
+                video = os.path.join(args.record_dir, f"episode_{ep:03d}{tag}.mp4")
+                save_video(frames, video, fps=frequency)
+                result["video"] = video
+            results.append(result)
+
+    except KeyboardInterrupt:
+        log.info("Aborted by user.")
+    finally:
+        if not args.no_vis:
+            cv2.destroyAllWindows()
+        robot.stop()
+
+    # ── Evaluation summary ──
+    if evaluating and results:
+        n_ok = sum(r["success"] for r in results)
+        summary = {
+            "ckpt_dir": args.ckpt_dir,
+            "temporal_agg": args.temporal_agg,
+            "k": args.k,
+            "frequency": frequency,
+            "max_steps": args.max_steps,
+            "n_episodes": len(results),
+            "n_success": n_ok,
+            "success_rate": n_ok / len(results),
+            "episodes": results,
+        }
+        out = os.path.join(args.ckpt_dir, f"eval_{time.strftime('%Y%m%d_%H%M%S')}.json")
+        with open(out, "w") as f:
+            json.dump(summary, f, indent=2)
+        log.info(f"Success rate: {n_ok}/{len(results)} = {n_ok / len(results):.0%}  → {out}")
 
 
 if __name__ == "__main__":

@@ -35,11 +35,9 @@ Key design choices:
 """
 
 import torch
-import torch.nn.functional as F
 import torchvision
 from torch import nn
 from torchvision.models._utils import IntermediateLayerGetter
-from typing import Dict, List
 
 from .position_encoding import PositionEmbeddingSine
 
@@ -72,17 +70,18 @@ class FrozenBatchNorm2d(nn.Module):
         self.register_buffer("running_mean", torch.zeros(n))
         self.register_buffer("running_var", torch.ones(n))
 
-    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
-                              missing_keys, unexpected_keys, error_msgs):
+    def _load_from_state_dict(
+        self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+    ):
         # Remove num_batches_tracked from state_dict if present — it's a
         # standard BN buffer that FrozenBN doesn't use
-        num_batches_tracked_key = prefix + 'num_batches_tracked'
+        num_batches_tracked_key = prefix + "num_batches_tracked"
         if num_batches_tracked_key in state_dict:
             del state_dict[num_batches_tracked_key]
 
         super()._load_from_state_dict(
-            state_dict, prefix, local_metadata, strict,
-            missing_keys, unexpected_keys, error_msgs)
+            state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+        )
 
     def forward(self, x):
         # Reshape to (1, C, 1, 1) for broadcasting with (N, C, H, W) input
@@ -114,16 +113,19 @@ class BackboneBase(nn.Module):
                               if False, return only layer4
     """
 
-    def __init__(self, backbone, train_backbone, num_channels,
-                 return_interm_layers):
+    def __init__(self, backbone, train_backbone, num_channels, return_interm_layers):
         super().__init__()
+        # Original ACT commented out DETR's "only train layer2-4" rule and
+        # fine-tunes the whole ResNet. We keep that, but honour
+        # train_backbone=False (lr_backbone=0) by actually freezing the weights:
+        # an lr of 0 alone would still compute and store backbone gradients.
+        if not train_backbone:
+            backbone.requires_grad_(False)
         if return_interm_layers:
-            return_layers = {"layer1": "0", "layer2": "1",
-                             "layer3": "2", "layer4": "3"}
+            return_layers = {"layer1": "0", "layer2": "1", "layer3": "2", "layer4": "3"}
         else:
-            return_layers = {'layer4': "0"}
-        self.body = IntermediateLayerGetter(backbone,
-                                           return_layers=return_layers)
+            return_layers = {"layer4": "0"}
+        self.body = IntermediateLayerGetter(backbone, return_layers=return_layers)
         self.num_channels = num_channels
 
     def forward(self, tensor):
@@ -159,11 +161,11 @@ class Backbone(BackboneBase):
         backbone = getattr(torchvision.models, name)(
             replace_stride_with_dilation=[False, False, dilation],
             weights="IMAGENET1K_V1",
-            norm_layer=FrozenBatchNorm2d)
+            norm_layer=FrozenBatchNorm2d,
+        )
         # ResNet18/34 have 512 channels in layer4; ResNet50+ have 2048
-        num_channels = 512 if name in ('resnet18', 'resnet34') else 2048
-        super().__init__(backbone, train_backbone, num_channels,
-                         return_interm_layers)
+        num_channels = 512 if name in ("resnet18", "resnet34") else 2048
+        super().__init__(backbone, train_backbone, num_channels, return_interm_layers)
 
 
 class Joiner(nn.Sequential):
@@ -216,11 +218,11 @@ def build_backbone(backbone_name, hidden_dim, lr_backbone=1e-5, dilation=False):
     Returns:
         Joiner model with .num_channels attribute
     """
-    position_embedding = PositionEmbeddingSine(
-        num_pos_feats=hidden_dim // 2, normalize=True)
+    position_embedding = PositionEmbeddingSine(num_pos_feats=hidden_dim // 2, normalize=True)
     train_backbone = lr_backbone > 0
-    backbone = Backbone(backbone_name, train_backbone,
-                        return_interm_layers=False, dilation=dilation)
+    backbone = Backbone(
+        backbone_name, train_backbone, return_interm_layers=False, dilation=dilation
+    )
     model = Joiner(backbone, position_embedding)
     model.num_channels = backbone.num_channels
     return model

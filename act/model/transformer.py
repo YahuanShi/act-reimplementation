@@ -36,7 +36,7 @@ from typing import Optional
 
 import torch
 import torch.nn.functional as F
-from torch import nn, Tensor
+from torch import Tensor, nn
 
 
 class Transformer(nn.Module):
@@ -63,26 +63,36 @@ class Transformer(nn.Module):
         return_intermediate_dec: if True, decoder returns all layer outputs
     """
 
-    def __init__(self, d_model=512, nhead=8, num_encoder_layers=6,
-                 num_decoder_layers=6, dim_feedforward=2048, dropout=0.1,
-                 activation="relu", normalize_before=False,
-                 return_intermediate_dec=False):
+    def __init__(
+        self,
+        d_model=512,
+        nhead=8,
+        num_encoder_layers=6,
+        num_decoder_layers=6,
+        dim_feedforward=2048,
+        dropout=0.1,
+        activation="relu",
+        normalize_before=False,
+        return_intermediate_dec=False,
+    ):
         super().__init__()
 
         encoder_layer = TransformerEncoderLayer(
-            d_model, nhead, dim_feedforward, dropout, activation,
-            normalize_before)
+            d_model, nhead, dim_feedforward, dropout, activation, normalize_before
+        )
         encoder_norm = nn.LayerNorm(d_model) if normalize_before else None
-        self.encoder = TransformerEncoder(
-            encoder_layer, num_encoder_layers, encoder_norm)
+        self.encoder = TransformerEncoder(encoder_layer, num_encoder_layers, encoder_norm)
 
         decoder_layer = TransformerDecoderLayer(
-            d_model, nhead, dim_feedforward, dropout, activation,
-            normalize_before)
+            d_model, nhead, dim_feedforward, dropout, activation, normalize_before
+        )
         decoder_norm = nn.LayerNorm(d_model)
         self.decoder = TransformerDecoder(
-            decoder_layer, num_decoder_layers, decoder_norm,
-            return_intermediate=return_intermediate_dec)
+            decoder_layer,
+            num_decoder_layers,
+            decoder_norm,
+            return_intermediate=return_intermediate_dec,
+        )
 
         self._reset_parameters()
         self.d_model = d_model
@@ -94,9 +104,16 @@ class Transformer(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    def forward(self, src, mask, query_embed, pos_embed,
-                latent_input=None, proprio_input=None,
-                additional_pos_embed=None):
+    def forward(
+        self,
+        src,
+        mask,
+        query_embed,
+        pos_embed,
+        latent_input=None,
+        proprio_input=None,
+        additional_pos_embed=None,
+    ):
         """
         Forward pass through the full encoder-decoder Transformer.
 
@@ -126,13 +143,11 @@ class Transformer(nn.Module):
 
             # Prepend latent and proprio tokens with their position embeddings
             # additional_pos_embed shape: (2, d_model) -> (2, bs, d_model)
-            additional_pos_embed = additional_pos_embed.unsqueeze(1).repeat(
-                1, bs, 1)
+            additional_pos_embed = additional_pos_embed.unsqueeze(1).repeat(1, bs, 1)
             pos_embed = torch.cat([additional_pos_embed, pos_embed], axis=0)
 
             # Stack latent and proprio as (2, bs, d_model), prepend to src
-            addition_input = torch.stack(
-                [latent_input, proprio_input], axis=0)
+            addition_input = torch.stack([latent_input, proprio_input], axis=0)
             src = torch.cat([addition_input, src], axis=0)
         else:
             # Pre-flattened features: (bs, HW, C) -> (HW, bs, C)
@@ -150,8 +165,9 @@ class Transformer(nn.Module):
         memory = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed)
 
         # Decode: queries cross-attend to memory to produce action predictions
-        hs = self.decoder(tgt, memory, memory_key_padding_mask=mask,
-                          pos=pos_embed, query_pos=query_embed)
+        hs = self.decoder(
+            tgt, memory, memory_key_padding_mask=mask, pos=pos_embed, query_pos=query_embed
+        )
 
         # Transpose from (num_layers, seq, bs, d_model) to (num_layers, bs, seq, d_model)
         hs = hs.transpose(1, 2)
@@ -178,10 +194,13 @@ class TransformerEncoder(nn.Module):
         self.num_layers = num_layers
         self.norm = norm
 
-    def forward(self, src,
-                mask: Optional[Tensor] = None,
-                src_key_padding_mask: Optional[Tensor] = None,
-                pos: Optional[Tensor] = None):
+    def forward(
+        self,
+        src,
+        mask: Optional[Tensor] = None,
+        src_key_padding_mask: Optional[Tensor] = None,
+        pos: Optional[Tensor] = None,
+    ):
         """
         Args:
             src: (seq_len, bs, d_model) input sequence
@@ -194,8 +213,9 @@ class TransformerEncoder(nn.Module):
         """
         output = src
         for layer in self.layers:
-            output = layer(output, src_mask=mask,
-                           src_key_padding_mask=src_key_padding_mask, pos=pos)
+            output = layer(
+                output, src_mask=mask, src_key_padding_mask=src_key_padding_mask, pos=pos
+            )
 
         if self.norm is not None:
             output = self.norm(output)
@@ -218,21 +238,24 @@ class TransformerDecoder(nn.Module):
         return_intermediate: if True, return all layer outputs stacked
     """
 
-    def __init__(self, decoder_layer, num_layers, norm=None,
-                 return_intermediate=False):
+    def __init__(self, decoder_layer, num_layers, norm=None, return_intermediate=False):
         super().__init__()
         self.layers = _get_clones(decoder_layer, num_layers)
         self.num_layers = num_layers
         self.norm = norm
         self.return_intermediate = return_intermediate
 
-    def forward(self, tgt, memory,
-                tgt_mask: Optional[Tensor] = None,
-                memory_mask: Optional[Tensor] = None,
-                tgt_key_padding_mask: Optional[Tensor] = None,
-                memory_key_padding_mask: Optional[Tensor] = None,
-                pos: Optional[Tensor] = None,
-                query_pos: Optional[Tensor] = None):
+    def forward(
+        self,
+        tgt,
+        memory,
+        tgt_mask: Optional[Tensor] = None,
+        memory_mask: Optional[Tensor] = None,
+        tgt_key_padding_mask: Optional[Tensor] = None,
+        memory_key_padding_mask: Optional[Tensor] = None,
+        pos: Optional[Tensor] = None,
+        query_pos: Optional[Tensor] = None,
+    ):
         """
         Args:
             tgt: (num_queries, bs, d_model) decoder input (initialized to zeros)
@@ -252,12 +275,16 @@ class TransformerDecoder(nn.Module):
         intermediate = []
 
         for layer in self.layers:
-            output = layer(output, memory,
-                           tgt_mask=tgt_mask,
-                           memory_mask=memory_mask,
-                           tgt_key_padding_mask=tgt_key_padding_mask,
-                           memory_key_padding_mask=memory_key_padding_mask,
-                           pos=pos, query_pos=query_pos)
+            output = layer(
+                output,
+                memory,
+                tgt_mask=tgt_mask,
+                memory_mask=memory_mask,
+                tgt_key_padding_mask=tgt_key_padding_mask,
+                memory_key_padding_mask=memory_key_padding_mask,
+                pos=pos,
+                query_pos=query_pos,
+            )
             if self.return_intermediate:
                 intermediate.append(self.norm(output))
 
@@ -297,8 +324,15 @@ class TransformerEncoderLayer(nn.Module):
         normalize_before: if True, use pre-norm
     """
 
-    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1,
-                 activation="relu", normalize_before=False):
+    def __init__(
+        self,
+        d_model,
+        nhead,
+        dim_feedforward=2048,
+        dropout=0.1,
+        activation="relu",
+        normalize_before=False,
+    ):
         super().__init__()
         self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
         self.linear1 = nn.Linear(d_model, dim_feedforward)
@@ -317,13 +351,13 @@ class TransformerEncoderLayer(nn.Module):
         """Add position encoding to tensor if provided."""
         return tensor if pos is None else tensor + pos
 
-    def forward_post(self, src, src_mask=None, src_key_padding_mask=None,
-                     pos=None):
+    def forward_post(self, src, src_mask=None, src_key_padding_mask=None, pos=None):
         """Post-norm: attention -> residual -> norm -> FFN -> residual -> norm"""
         # Self-attention: add pos to Q and K only, V stays as raw content
         q = k = self.with_pos_embed(src, pos)
-        src2 = self.self_attn(q, k, value=src, attn_mask=src_mask,
-                              key_padding_mask=src_key_padding_mask)[0]
+        src2 = self.self_attn(
+            q, k, value=src, attn_mask=src_mask, key_padding_mask=src_key_padding_mask
+        )[0]
         src = src + self.dropout1(src2)
         src = self.norm1(src)
 
@@ -333,13 +367,13 @@ class TransformerEncoderLayer(nn.Module):
         src = self.norm2(src)
         return src
 
-    def forward_pre(self, src, src_mask=None, src_key_padding_mask=None,
-                    pos=None):
+    def forward_pre(self, src, src_mask=None, src_key_padding_mask=None, pos=None):
         """Pre-norm: norm -> attention -> residual -> norm -> FFN -> residual"""
         src2 = self.norm1(src)
         q = k = self.with_pos_embed(src2, pos)
-        src2 = self.self_attn(q, k, value=src2, attn_mask=src_mask,
-                              key_padding_mask=src_key_padding_mask)[0]
+        src2 = self.self_attn(
+            q, k, value=src2, attn_mask=src_mask, key_padding_mask=src_key_padding_mask
+        )[0]
         src = src + self.dropout1(src2)
         src2 = self.norm2(src)
         src2 = self.linear2(self.dropout(self.activation(self.linear1(src2))))
@@ -374,12 +408,18 @@ class TransformerDecoderLayer(nn.Module):
         normalize_before: if True, use pre-norm
     """
 
-    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1,
-                 activation="relu", normalize_before=False):
+    def __init__(
+        self,
+        d_model,
+        nhead,
+        dim_feedforward=2048,
+        dropout=0.1,
+        activation="relu",
+        normalize_before=False,
+    ):
         super().__init__()
         self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
-        self.multihead_attn = nn.MultiheadAttention(
-            d_model, nhead, dropout=dropout)
+        self.multihead_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
         self.linear1 = nn.Linear(d_model, dim_feedforward)
         self.dropout = nn.Dropout(dropout)
         self.linear2 = nn.Linear(dim_feedforward, d_model)
@@ -397,16 +437,23 @@ class TransformerDecoderLayer(nn.Module):
     def with_pos_embed(self, tensor, pos: Optional[Tensor]):
         return tensor if pos is None else tensor + pos
 
-    def forward_post(self, tgt, memory,
-                     tgt_mask=None, memory_mask=None,
-                     tgt_key_padding_mask=None,
-                     memory_key_padding_mask=None,
-                     pos=None, query_pos=None):
+    def forward_post(
+        self,
+        tgt,
+        memory,
+        tgt_mask=None,
+        memory_mask=None,
+        tgt_key_padding_mask=None,
+        memory_key_padding_mask=None,
+        pos=None,
+        query_pos=None,
+    ):
         """Post-norm decoder layer."""
         # 1. Self-attention among queries
         q = k = self.with_pos_embed(tgt, query_pos)
-        tgt2 = self.self_attn(q, k, value=tgt, attn_mask=tgt_mask,
-                              key_padding_mask=tgt_key_padding_mask)[0]
+        tgt2 = self.self_attn(
+            q, k, value=tgt, attn_mask=tgt_mask, key_padding_mask=tgt_key_padding_mask
+        )[0]
         tgt = tgt + self.dropout1(tgt2)
         tgt = self.norm1(tgt)
 
@@ -417,7 +464,8 @@ class TransformerDecoderLayer(nn.Module):
             key=self.with_pos_embed(memory, pos),
             value=memory,
             attn_mask=memory_mask,
-            key_padding_mask=memory_key_padding_mask)[0]
+            key_padding_mask=memory_key_padding_mask,
+        )[0]
         tgt = tgt + self.dropout2(tgt2)
         tgt = self.norm2(tgt)
 
@@ -427,16 +475,23 @@ class TransformerDecoderLayer(nn.Module):
         tgt = self.norm3(tgt)
         return tgt
 
-    def forward_pre(self, tgt, memory,
-                    tgt_mask=None, memory_mask=None,
-                    tgt_key_padding_mask=None,
-                    memory_key_padding_mask=None,
-                    pos=None, query_pos=None):
+    def forward_pre(
+        self,
+        tgt,
+        memory,
+        tgt_mask=None,
+        memory_mask=None,
+        tgt_key_padding_mask=None,
+        memory_key_padding_mask=None,
+        pos=None,
+        query_pos=None,
+    ):
         """Pre-norm decoder layer."""
         tgt2 = self.norm1(tgt)
         q = k = self.with_pos_embed(tgt2, query_pos)
-        tgt2 = self.self_attn(q, k, value=tgt2, attn_mask=tgt_mask,
-                              key_padding_mask=tgt_key_padding_mask)[0]
+        tgt2 = self.self_attn(
+            q, k, value=tgt2, attn_mask=tgt_mask, key_padding_mask=tgt_key_padding_mask
+        )[0]
         tgt = tgt + self.dropout1(tgt2)
 
         tgt2 = self.norm2(tgt)
@@ -445,7 +500,8 @@ class TransformerDecoderLayer(nn.Module):
             key=self.with_pos_embed(memory, pos),
             value=memory,
             attn_mask=memory_mask,
-            key_padding_mask=memory_key_padding_mask)[0]
+            key_padding_mask=memory_key_padding_mask,
+        )[0]
         tgt = tgt + self.dropout2(tgt2)
 
         tgt2 = self.norm3(tgt)
@@ -453,17 +509,38 @@ class TransformerDecoderLayer(nn.Module):
         tgt = tgt + self.dropout3(tgt2)
         return tgt
 
-    def forward(self, tgt, memory,
-                tgt_mask=None, memory_mask=None,
-                tgt_key_padding_mask=None, memory_key_padding_mask=None,
-                pos=None, query_pos=None):
+    def forward(
+        self,
+        tgt,
+        memory,
+        tgt_mask=None,
+        memory_mask=None,
+        tgt_key_padding_mask=None,
+        memory_key_padding_mask=None,
+        pos=None,
+        query_pos=None,
+    ):
         if self.normalize_before:
-            return self.forward_pre(tgt, memory, tgt_mask, memory_mask,
-                                    tgt_key_padding_mask,
-                                    memory_key_padding_mask, pos, query_pos)
-        return self.forward_post(tgt, memory, tgt_mask, memory_mask,
-                                 tgt_key_padding_mask,
-                                 memory_key_padding_mask, pos, query_pos)
+            return self.forward_pre(
+                tgt,
+                memory,
+                tgt_mask,
+                memory_mask,
+                tgt_key_padding_mask,
+                memory_key_padding_mask,
+                pos,
+                query_pos,
+            )
+        return self.forward_post(
+            tgt,
+            memory,
+            tgt_mask,
+            memory_mask,
+            tgt_key_padding_mask,
+            memory_key_padding_mask,
+            pos,
+            query_pos,
+        )
 
 
 def _get_clones(module, N):

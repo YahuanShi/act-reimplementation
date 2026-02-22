@@ -46,11 +46,10 @@ Key dimensions:
 import torch
 from torch import nn
 from torch.autograd import Variable
-import numpy as np
 
 from .backbone import build_backbone
-from .transformer import Transformer, TransformerEncoder, TransformerEncoderLayer
 from .position_encoding import get_sinusoid_encoding_table
+from .transformer import Transformer, TransformerEncoder, TransformerEncoderLayer
 
 
 def reparametrize(mu, logvar):
@@ -93,8 +92,17 @@ class DETRVAE(nn.Module):
         latent_dim: dimension of the CVAE latent space (default 32)
     """
 
-    def __init__(self, backbones, transformer, encoder, state_dim, action_dim,
-                 num_queries, camera_names, latent_dim=32):
+    def __init__(
+        self,
+        backbones,
+        transformer,
+        encoder,
+        state_dim,
+        action_dim,
+        num_queries,
+        camera_names,
+        latent_dim=32,
+    ):
         super().__init__()
         self.num_queries = num_queries
         self.camera_names = camera_names
@@ -120,8 +128,7 @@ class DETRVAE(nn.Module):
         # ── Visual backbone projection ──
         if backbones is not None:
             # Project backbone features (512 for ResNet18) to hidden_dim
-            self.input_proj = nn.Conv2d(
-                backbones[0].num_channels, hidden_dim, kernel_size=1)
+            self.input_proj = nn.Conv2d(backbones[0].num_channels, hidden_dim, kernel_size=1)
             self.backbones = nn.ModuleList(backbones)
             self.input_proj_robot_state = nn.Linear(state_dim, hidden_dim)
         else:
@@ -149,8 +156,8 @@ class DETRVAE(nn.Module):
         # Fixed sinusoidal position encoding for the CVAE encoder input
         # Sequence: [CLS(1), qpos(1), action_1, ..., action_T] = 2 + num_queries
         self.register_buffer(
-            'pos_table',
-            get_sinusoid_encoding_table(1 + 1 + num_queries, hidden_dim))
+            "pos_table", get_sinusoid_encoding_table(1 + 1 + num_queries, hidden_dim)
+        )
 
         # ── Decoder extra components ──
         # Project the latent sample back to hidden_dim for the decoder
@@ -185,7 +192,7 @@ class DETRVAE(nn.Module):
         if is_training:
             # Project each component to hidden_dim
             action_embed = self.encoder_action_proj(actions)  # (bs, seq, hidden_dim)
-            qpos_embed = self.encoder_joint_proj(qpos)        # (bs, hidden_dim)
+            qpos_embed = self.encoder_joint_proj(qpos)  # (bs, hidden_dim)
             qpos_embed = torch.unsqueeze(qpos_embed, axis=1)  # (bs, 1, hidden_dim)
 
             # CLS token: (1, hidden_dim) -> (bs, 1, hidden_dim)
@@ -193,8 +200,7 @@ class DETRVAE(nn.Module):
             cls_embed = torch.unsqueeze(cls_embed, axis=0).repeat(bs, 1, 1)
 
             # Concatenate: [CLS, qpos, action_1, ..., action_T]
-            encoder_input = torch.cat(
-                [cls_embed, qpos_embed, action_embed], axis=1)
+            encoder_input = torch.cat([cls_embed, qpos_embed, action_embed], axis=1)
             # Permute to (seq_len, bs, hidden_dim) for PyTorch Transformer
             encoder_input = encoder_input.permute(1, 0, 2)
 
@@ -207,14 +213,13 @@ class DETRVAE(nn.Module):
             pos_embed = pos_embed.permute(1, 0, 2)  # (seq_len, 1, hidden_dim)
 
             # Run the CVAE encoder
-            encoder_output = self.encoder(
-                encoder_input, pos=pos_embed, src_key_padding_mask=is_pad)
+            encoder_output = self.encoder(encoder_input, pos=pos_embed, src_key_padding_mask=is_pad)
 
             # Extract CLS token output (first position) for latent prediction
             encoder_output = encoder_output[0]  # (bs, hidden_dim)
             latent_info = self.latent_proj(encoder_output)  # (bs, latent_dim*2)
-            mu = latent_info[:, :self.latent_dim]
-            logvar = latent_info[:, self.latent_dim:]
+            mu = latent_info[:, : self.latent_dim]
+            logvar = latent_info[:, self.latent_dim :]
             latent_sample = reparametrize(mu, logvar)
             latent_input = self.latent_out_proj(latent_sample)  # (bs, hidden_dim)
         else:
@@ -222,8 +227,7 @@ class DETRVAE(nn.Module):
             # Since KL regularization pushes the posterior toward N(0, I),
             # the prior mean is a reasonable single-sample estimate
             mu = logvar = None
-            latent_sample = torch.zeros(
-                [bs, self.latent_dim], dtype=torch.float32).to(qpos.device)
+            latent_sample = torch.zeros([bs, self.latent_dim], dtype=torch.float32).to(qpos.device)
             latent_input = self.latent_out_proj(latent_sample)
 
         # ════════════════════════════════════════════════════════════════
@@ -253,22 +257,27 @@ class DETRVAE(nn.Module):
             # The transformer prepends [latent, proprio] to the flattened
             # image features, then decodes num_queries action predictions
             hs = self.transformer(
-                src, None, self.query_embed.weight, pos,
-                latent_input, proprio_input,
-                self.additional_pos_embed.weight)[0]
+                src,
+                None,
+                self.query_embed.weight,
+                pos,
+                latent_input,
+                proprio_input,
+                self.additional_pos_embed.weight,
+            )[0]
         else:
             # State-only mode (no visual input)
             qpos = self.input_proj_robot_state(qpos)
             env_state = self.input_proj_env_state(env_state)
             transformer_input = torch.cat([qpos, env_state], axis=1)
             hs = self.transformer(
-                transformer_input, None,
-                self.query_embed.weight, self.pos.weight)[0]
+                transformer_input, None, self.query_embed.weight, self.pos.weight
+            )[0]
 
         # ════════════════════════════════════════════════════════════════
         # Step 3: Project decoder output to actions
         # ════════════════════════════════════════════════════════════════
-        a_hat = self.action_head(hs)       # (bs, num_queries, action_dim)
+        a_hat = self.action_head(hs)  # (bs, num_queries, action_dim)
         is_pad_hat = self.is_pad_head(hs)  # (bs, num_queries, 1)
 
         return a_hat, is_pad_hat, [mu, logvar]
@@ -320,8 +329,7 @@ def kl_divergence(mu, logvar):
     return total_kld, dimension_wise_kld, mean_kld
 
 
-def build_encoder(hidden_dim, dropout, nhead, dim_feedforward, enc_layers,
-                  normalize_before):
+def build_encoder(hidden_dim, dropout, nhead, dim_feedforward, enc_layers, normalize_before):
     """
     Build the CVAE encoder (a standalone TransformerEncoder).
 
@@ -341,7 +349,8 @@ def build_encoder(hidden_dim, dropout, nhead, dim_feedforward, enc_layers,
         TransformerEncoder instance
     """
     encoder_layer = TransformerEncoderLayer(
-        hidden_dim, nhead, dim_feedforward, dropout, "relu", normalize_before)
+        hidden_dim, nhead, dim_feedforward, dropout, "relu", normalize_before
+    )
     encoder_norm = nn.LayerNorm(hidden_dim) if normalize_before else None
     encoder = TransformerEncoder(encoder_layer, enc_layers, encoder_norm)
     return encoder
@@ -363,41 +372,49 @@ def build_act_model(config):
     Returns:
         DETRVAE model instance
     """
-    state_dim = config['state_dim']
-    action_dim = config['action_dim']
-    hidden_dim = config['hidden_dim']
-    dim_feedforward = config['dim_feedforward']
-    nhead = config['nheads']
-    enc_layers = config['enc_layers']
-    dec_layers = config['dec_layers']
-    num_queries = config['num_queries']
-    camera_names = config['camera_names']
-    latent_dim = config.get('latent_dim', 32)
-    dropout = config.get('dropout', 0.1)
-    pre_norm = config.get('pre_norm', False)
+    state_dim = config["state_dim"]
+    action_dim = config["action_dim"]
+    hidden_dim = config["hidden_dim"]
+    dim_feedforward = config["dim_feedforward"]
+    nhead = config["nheads"]
+    enc_layers = config["enc_layers"]
+    dec_layers = config["dec_layers"]
+    num_queries = config["num_queries"]
+    camera_names = config["camera_names"]
+    latent_dim = config.get("latent_dim", 32)
+    dropout = config.get("dropout", 0.1)
+    pre_norm = config.get("pre_norm", False)
 
     # Build visual backbone
     backbones = []
-    backbone = build_backbone(
-        config['backbone'], hidden_dim, config['lr_backbone'])
+    backbone = build_backbone(config["backbone"], hidden_dim, config["lr_backbone"])
     backbones.append(backbone)
 
     # Build DETR Transformer (encoder-decoder)
     transformer = Transformer(
-        d_model=hidden_dim, dropout=dropout, nhead=nhead,
+        d_model=hidden_dim,
+        dropout=dropout,
+        nhead=nhead,
         dim_feedforward=dim_feedforward,
-        num_encoder_layers=enc_layers, num_decoder_layers=dec_layers,
-        normalize_before=pre_norm, return_intermediate_dec=True)
+        num_encoder_layers=enc_layers,
+        num_decoder_layers=dec_layers,
+        normalize_before=pre_norm,
+        return_intermediate_dec=True,
+    )
 
     # Build CVAE encoder
-    encoder = build_encoder(
-        hidden_dim, dropout, nhead, dim_feedforward, enc_layers, pre_norm)
+    encoder = build_encoder(hidden_dim, dropout, nhead, dim_feedforward, enc_layers, pre_norm)
 
     model = DETRVAE(
-        backbones, transformer, encoder,
-        state_dim=state_dim, action_dim=action_dim,
-        num_queries=num_queries, camera_names=camera_names,
-        latent_dim=latent_dim)
+        backbones,
+        transformer,
+        encoder,
+        state_dim=state_dim,
+        action_dim=action_dim,
+        num_queries=num_queries,
+        camera_names=camera_names,
+        latent_dim=latent_dim,
+    )
 
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"DETRVAE parameters: {n_parameters / 1e6:.2f}M")

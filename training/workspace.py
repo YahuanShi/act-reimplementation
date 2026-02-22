@@ -3,17 +3,20 @@ Training workspace for ACT.
 
 Training loop structure (validate-first, then train each epoch):
   for each epoch:
-    1. Validation pass  → log val loss
+    1. Validation pass  → log val loss (computed with the EMA weights, i.e.
+                          the same weights that get saved as policy_best)
     2. Training pass    → gradient update per batch + EMA step
     3. Log metrics, save checkpoints
 
 Checkpointing strategy:
   - policy_best.ckpt    : EMA weights at lowest val loss — use for inference
   - policy_last.ckpt    : EMA weights at final epoch
-  - checkpoint_full.pt  : full state (policy + EMA + optimizer + epoch/step)
-                           written every save_every epochs, used for --resume
-  - checkpoint_stepN.pt : step-level full checkpoint every save_every_steps steps
-                           keeps last max_keep_ckpts, for crash recovery
+  - checkpoint_full.pt  : latest full state (policy + EMA + optimizer + epoch/step),
+                           overwritten every save_every epochs and at the end — use for --resume
+  - checkpoint_epochN.pt: periodic copies of the full state (keeps last max_keep_ckpts)
+  - checkpoint_stepN.pt : step-level full state every save_every_steps steps
+                           (keeps last max_keep_ckpts), also valid for --resume:
+                           the interrupted epoch is re-run from its start
   - dataset_stats.pkl   : normalizer stats for inference
   - config.json         : all hyperparameters for reproducibility
 
@@ -25,8 +28,10 @@ Optional wandb logging:
 
 import glob
 import json
+import math
 import os
 import pickle
+import warnings
 from copy import deepcopy
 
 import matplotlib
@@ -95,9 +100,7 @@ class TrainWorkspace:
         optimizer = policy.configure_optimizers()
 
         total_steps = len(train_dataloader) * num_epochs
-        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=total_steps, eta_min=config.get("lr", 1e-5) / 10
-        )
+        lr_scheduler = _cosine_schedule(optimizer, total_steps, min_lr_ratio=0.1)
 
         # ── EMA ──
         ema = EMAModel(policy) if use_ema else None
@@ -122,12 +125,18 @@ class TrainWorkspace:
             optimizer.load_state_dict(ckpt["optimizer_state_dict"])
             if ema is not None and "ema_state_dict" in ckpt:
                 ema.load_state_dict(ckpt["ema_state_dict"])
-            start_epoch = ckpt["epoch"] + 1
+            # Epoch-level checkpoints are written after an epoch finished;
+            # step-level ones are written mid-epoch, so that epoch is re-run.
+            epoch_done = ckpt.get("epoch_complete", True)
+            start_epoch = ckpt["epoch"] + 1 if epoch_done else ckpt["epoch"]
             global_step = ckpt["global_step"]
             min_val_loss = ckpt.get("best_val_loss", float("inf"))
-            # Fast-forward scheduler to match global_step
-            for _ in range(global_step):
-                lr_scheduler.step()
+            # Fast-forward scheduler to match global_step (no optimizer.step()
+            # in between is intended here, so silence PyTorch's order warning)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                for _ in range(global_step):
+                    lr_scheduler.step()
             print(f"Resumed from {resume_path} (epoch {start_epoch}, step {global_step})")
 
         # ── WandB ──
@@ -152,7 +161,10 @@ class TrainWorkspace:
 
         for epoch in tqdm(range(start_epoch, num_epochs), desc="Training"):
             # ── Validation ──
-            val_summary = self._validate(policy, val_dataloader)
+            # Evaluate the EMA weights: they are what policy_best.ckpt stores
+            # and what gets deployed, so model selection must be based on them.
+            eval_policy = ema.averaged_model if ema is not None else policy
+            val_summary = self._validate(eval_policy, val_dataloader)
             validation_history.append(val_summary)
             epoch_val_loss = val_summary["loss"].item()
 
@@ -178,6 +190,8 @@ class TrainWorkspace:
                 ema,
                 save_every_steps,
                 max_keep_ckpts,
+                epoch,
+                min_val_loss,
             )
             train_history.extend(epoch_train_losses)
             epoch_train_summary = _compute_dict_mean(epoch_train_losses)
@@ -215,45 +229,30 @@ class TrainWorkspace:
 
             # ── Periodic checkpoint ──
             if save_every > 0 and epoch % save_every == 0 and epoch > 0:
-                full_path = os.path.join(self.ckpt_dir, f"checkpoint_epoch{epoch}.pt")
-                ckpt_data = {
-                    "epoch": epoch,
-                    "global_step": global_step,
-                    "policy_state_dict": policy.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "best_val_loss": min_val_loss,
-                }
-                if ema is not None:
-                    ckpt_data["ema_state_dict"] = ema.state_dict()
-                torch.save(ckpt_data, full_path)
-                # Keep only the last max_keep_ckpts periodic checkpoints
-                if max_keep_ckpts > 0:
-                    all_ckpts = sorted(
-                        glob.glob(os.path.join(self.ckpt_dir, "checkpoint_epoch*.pt"))
-                    )
-                    for old in all_ckpts[:-max_keep_ckpts]:
-                        os.remove(old)
+                ckpt_data = _full_state(
+                    policy, optimizer, ema, epoch, global_step, min_val_loss, epoch_complete=True
+                )
+                # checkpoint_full.pt always holds the latest resumable state
+                torch.save(ckpt_data, os.path.join(self.ckpt_dir, "checkpoint_full.pt"))
+                torch.save(ckpt_data, os.path.join(self.ckpt_dir, f"checkpoint_epoch{epoch}.pt"))
+                _prune_ckpts(self.ckpt_dir, "checkpoint_epoch*.pt", max_keep_ckpts)
                 self._plot_history(train_history, validation_history, epoch, num_epochs)
 
         # ── Final saves ──
-        # Copy EMA weights into policy before saving last checkpoint
+        # Full checkpoint for potential resume — saved BEFORE copying EMA into
+        # the live policy, so that resuming continues from the raw weights.
+        last_epoch = max(start_epoch, num_epochs) - 1
+        full_ckpt = _full_state(
+            policy, optimizer, ema, last_epoch, global_step, min_val_loss, epoch_complete=True
+        )
+        torch.save(full_ckpt, os.path.join(self.ckpt_dir, "checkpoint_full.pt"))
+
+        # Copy EMA weights into policy before saving the last inference checkpoint
         if ema is not None:
             ema.copy_to(policy)
 
         last_path = os.path.join(self.ckpt_dir, "policy_last.ckpt")
         torch.save(policy.state_dict(), last_path)
-
-        # Full checkpoint for potential resume
-        full_ckpt = {
-            "epoch": num_epochs - 1,
-            "global_step": global_step,
-            "policy_state_dict": policy.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "best_val_loss": min_val_loss,
-        }
-        if ema is not None:
-            full_ckpt["ema_state_dict"] = ema.state_dict()
-        torch.save(full_ckpt, os.path.join(self.ckpt_dir, "checkpoint_full.pt"))
 
         if best_ckpt_info is not None:
             best_epoch, best_loss, _ = best_ckpt_info
@@ -284,6 +283,8 @@ class TrainWorkspace:
         ema=None,
         save_every_steps=0,
         max_keep_ckpts=5,
+        epoch=0,
+        best_val_loss=float("inf"),
     ):
         """One training epoch; returns (loss_dicts, updated_global_step)."""
         policy.train()
@@ -333,20 +334,12 @@ class TrainWorkspace:
             # ── Step-level checkpoint (crash recovery) ──
             if save_every_steps > 0 and global_step % save_every_steps == 0:
                 step_path = os.path.join(self.ckpt_dir, f"checkpoint_step{global_step}.pt")
-                step_ckpt = {
-                    "global_step": global_step,
-                    "policy_state_dict": policy.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                }
-                if ema is not None:
-                    step_ckpt["ema_state_dict"] = ema.state_dict()
+                # Written mid-epoch: epoch_complete=False makes --resume re-run this epoch
+                step_ckpt = _full_state(
+                    policy, optimizer, ema, epoch, global_step, best_val_loss, epoch_complete=False
+                )
                 torch.save(step_ckpt, step_path)
-                if max_keep_ckpts > 0:
-                    step_ckpts = sorted(
-                        glob.glob(os.path.join(self.ckpt_dir, "checkpoint_step*.pt"))
-                    )
-                    for old in step_ckpts[:-max_keep_ckpts]:
-                        os.remove(old)
+                _prune_ckpts(self.ckpt_dir, "checkpoint_step*.pt", max_keep_ckpts)
 
         return epoch_losses, global_step
 
@@ -387,6 +380,50 @@ class TrainWorkspace:
             plt.tight_layout()
             plt.savefig(plot_path)
             plt.close()
+
+
+def _cosine_schedule(optimizer, total_steps, min_lr_ratio=0.1):
+    """
+    Cosine decay from each group's base lr to min_lr_ratio * base lr, then flat.
+
+    Unlike CosineAnnealingLR (which is periodic and climbs back up after
+    T_max), the factor is clamped at total_steps — resuming from a mid-epoch
+    checkpoint re-runs part of an epoch and may overshoot total_steps slightly.
+    """
+
+    def factor(step):
+        progress = min(step, total_steps) / max(1, total_steps)
+        return min_lr_ratio + (1 - min_lr_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, factor)
+
+
+def _full_state(policy, optimizer, ema, epoch, global_step, best_val_loss, epoch_complete):
+    """Everything --resume needs to continue training."""
+    state = {
+        "epoch": epoch,
+        "epoch_complete": epoch_complete,
+        "global_step": global_step,
+        "policy_state_dict": policy.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "best_val_loss": best_val_loss,
+    }
+    if ema is not None:
+        state["ema_state_dict"] = ema.state_dict()
+    return state
+
+
+def _prune_ckpts(ckpt_dir, pattern, max_keep):
+    """Keep only the newest max_keep files matching pattern (0 = keep all)."""
+    if max_keep <= 0:
+        return
+    # Sort numerically by the trailing number (checkpoint_step1000 > checkpoint_step500)
+    paths = sorted(
+        glob.glob(os.path.join(ckpt_dir, pattern)),
+        key=lambda p: int("".join(c for c in os.path.basename(p) if c.isdigit()) or 0),
+    )
+    for old in paths[:-max_keep]:
+        os.remove(old)
 
 
 def _compute_dict_mean(dicts):

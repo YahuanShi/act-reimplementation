@@ -10,9 +10,11 @@ A from-scratch reimplementation of [Action Chunking with Transformers (ACT)](htt
 
 ## TODO
 
+- [ ] **Training** — Train on the UR5 pick-and-place dataset
 - [ ] **Demo** — Add demo GIF / video of real robot pick-and-place deployment
 - [ ] **Checkpoints** — Release trained checkpoints with download link
 - [ ] **Sim results** — Train on ALOHA TransferCube and report success rate (paper: ~90% scripted, ~50% human data)
+- [ ] **Results** — Report open-loop error (`eval.py --dataset`) and real-robot success rate (`inference.py --num_episodes`)
 
 ---
 
@@ -33,7 +35,6 @@ This is a **from-scratch reimplementation** of ACT, not a fork. Every line of co
 | **Checkpointing** | Epoch only | Epoch + step-level (crash recovery) |
 | **Comments** | Minimal | Learning-note style: explains the *why* behind each design |
 | **Environment** | conda + pip | `bash setup.sh` one-click (uv) |
-| **Scope** | ALOHA bimanual | Single-arm UR5 pick-and-place |
 
 ### ACT vs. Diffusion Policy
 
@@ -170,15 +171,19 @@ Step t+1: query → [â_t+1, â_t+2, â_t+3, ..., â_t+k  ]
 Step t+2: query → [â_t+2, â_t+3, â_t+4, ..., â_t+k+1]
 
 At step t+2, three predictions cover timestep t+2:
-  w_0 * â_t+2 (from step t+2, age=0, weight=1.0)
-+ w_1 * â_t+2 (from step t+1, age=1, weight=e^-m)
-+ w_2 * â_t+2 (from step t,   age=2, weight=e^-2m)
+  w_0 * â_t+2 (from step t,   the OLDEST prediction, weight=1.0)
++ w_1 * â_t+2 (from step t+1,                       weight=e^-k)
++ w_2 * â_t+2 (from step t+2, the NEWEST prediction, weight=e^-2k)
 ─────────────────────────────────────────────────
   blended_action_t+2  (normalized by sum of weights)
 ```
 
-`m` is the ensemble decay parameter — larger `m` makes the policy more reactive
-(recent predictions dominate); smaller `m` produces smoother motion.
+`k` is the ensemble decay constant (`--k`, default 0.01). As in the original ACT,
+the weights `w_i = exp(-k·i)` are indexed from the **oldest** prediction, so a
+larger `k` makes the motion smoother but slower to react to new observations
+(old predictions dominate), and `k → 0` approaches a uniform average. With the
+default `k = 0.01` and `chunk_size = 100`, the oldest prediction weighs only
+~2.7× the newest — close to uniform.
 
 **Cost:** temporal ensembling requires one policy query per step instead of one
 per chunk, making it ~`chunk_size`× more expensive. See `scripts/benchmark_inference.py`
@@ -195,15 +200,15 @@ Input:
 
                     ┌─────────────────────────────────────┐
   image ───────────►│  ResNet18 × num_cam  (FrozenBN)     │
-                    │  2D pos encoding + flatten           │──► image_tokens
-                    └─────────────────────────────────────┘
+                    │  2D pos encoding + flatten          │──► image_tokens
+                    └─────────────────────────────────────┤
                                                           │
-  z (latent, 0 at inference) ──────────────────────────► │
-  k learned action queries ────────────────────────────► │
+  z (latent, 0 at inference) ──────────────────────────►  │
+  k learned action queries ────────────────────────────►  │
                                                           │
                     ┌─────────────────────────────────────┤
-                    │  DETR Transformer Decoder            │
-                    │  self-attn → cross-attn(image_tokens)│
+                    │  DETR Transformer Decoder           │
+                    │ self-attn → cross-attn(image_tokens)│
                     └─────────────────────────────────────┘
                                     │
                                     ▼
@@ -212,9 +217,9 @@ Input:
 
 | Module | Class | Parameters (default config) |
 |--------|-------|---------------------------|
-| Visual backbone | `ACTBackbone` | ResNet18, FrozenBatchNorm2d, ImageNet init |
+| Visual backbone | `Backbone` + `Joiner` | ResNet18, FrozenBatchNorm2d, ImageNet init |
 | CVAE encoder | in `DETRVAE` | TransformerEncoder, z_dim=32 (training only) |
-| Action decoder | `DETRTransformer` | enc_layers=4, dec_layers=7, nheads=8, hidden=512 |
+| Action decoder | `Transformer` | enc_layers=4, dec_layers=7, nheads=8, hidden=512 |
 | Policy wrapper | `ACTPolicy` | L1 + β·KL loss, cosine LR, EMA |
 
 ---
@@ -248,8 +253,10 @@ Input:
 │   ├── test_normalizer.py          # Normalizer fit, normalize, denormalize
 │   ├── test_temporal_ensemble.py   # TemporalEnsemble correctness
 │   ├── test_ema.py                 # EMA decay schedule, step, copy_to, state_dict
-│   ├── test_integration.py         # End-to-end pipeline smoke test
-│   └── test_eval.py                # Rollout success logic, augmentation, ALOHA env adapter
+│   ├── test_split.py               # Episode-level train/val split
+│   ├── test_eval_tools.py          # Open-loop eval, camera order, image preprocessing
+│   ├── test_eval.py                # Rollout success logic, augmentation, ALOHA env adapter
+│   └── test_integration.py         # Train → checkpoint → resume → infer pipeline
 ├── scripts/
 │   ├── hdf5_to_lerobot.py          # HDF5 robot episodes → LeRobot v3 format
 │   ├── visualize_dataset.py        # Plot action distributions and trajectories
@@ -265,8 +272,8 @@ Input:
 │   ├── 08_inference_test.py        # InferencePipeline and temporal ensembling
 │   └── 09_integration_test.py      # Full pipeline: dataset → train → checkpoint → infer
 ├── train.py                        # Training entry point
-├── eval.py                         # Evaluation entry point (ALOHA sim or mock env)
-├── inference.py                    # Real robot inference (UR + Weiss gripper + RealSense)
+├── eval.py                         # Sim rollouts (ALOHA / mock) or open-loop eval on held-out episodes
+├── inference.py                    # Real robot inference + success-rate evaluation
 ├── setup.sh                        # One-click environment setup (uv)
 └── pyproject.toml                  # Dependencies and project metadata
 ```
@@ -340,31 +347,33 @@ Key arguments:
 |----------|---------|-------------|
 | `--dataset` | required | LeRobot dataset repo_id |
 | `--data_root` | None | Local dataset root directory |
+| `--episodes` | all | Only use these episode indices (quick debug runs) |
+| `--val_ratio` | 0.1 | Fraction of **episodes** held out for validation |
 | `--chunk_size` | 100 | Action chunk length (`num_queries`) |
 | `--epochs` | 20 | Passes over all frames (see note above) |
-| `--val_ratio` | 0.1 | Fraction of **episodes** held out for validation |
 | `--batch_size` | 8 | Batch size |
 | `--lr` | 1e-5 | Learning rate |
 | `--kl_weight` | 10.0 | CVAE KL divergence weight (β) |
 | `--latent_dim` | 32 | CVAE latent dimension |
 | `--grad_clip` | 1.0 | Gradient clipping max norm |
-| `--save_every` | 5 | Save epoch checkpoint every N epochs |
-| `--crop_ratio` | 1.0 | Random-crop fraction of H/W during training (1.0 = off) |
+| `--lr_backbone` | 1e-5 | Backbone learning rate (0 = frozen backbone) |
+| `--crop_ratio` | 1.0 | Random crop to this fraction of H/W in training, center crop at eval (1.0 = off) |
 | `--color_jitter` | False | Color jitter during training |
+| `--save_every` | 5 | Save epoch checkpoint every N epochs |
 | `--save_every_steps` | 0 | Save step checkpoint every N steps (0 = off) |
 | `--no_ema` | — | Disable EMA (EMA is on by default) |
 | `--wandb` | False | Enable wandb logging |
-| `--resume` | None | Path to `checkpoint_full.pt` to resume |
+| `--resume` | None | Path to `checkpoint_full.pt` / `checkpoint_epochN.pt` / `checkpoint_stepN.pt` |
 
 Output files (saved to `--ckpt_dir`, default `checkpoints/`):
 
-- `policy_best.ckpt` — EMA weights at lowest val loss, inference-ready
+- `policy_best.ckpt` — EMA weights at lowest val loss (val loss is computed with the EMA weights), inference-ready
 - `policy_last.ckpt` — EMA weights at final epoch
-- `checkpoint_full.pt` — full state for `--resume` (policy + EMA + optimizer + epoch)
+- `checkpoint_full.pt` — latest full state for `--resume` (policy + EMA + optimizer + epoch), updated every `--save_every` epochs and at the end
 - `checkpoint_epochN.pt` — periodic full checkpoints (keeps last `--max_keep_ckpts`)
-- `checkpoint_stepN.pt` — step-level checkpoints for crash recovery
+- `checkpoint_stepN.pt` — step-level checkpoints for crash recovery; resuming from one re-runs the interrupted epoch
 - `dataset_stats.pkl` — normalizer statistics
-- `config.json` — all hyperparameters
+- `config.json` — all hyperparameters plus data properties used at deployment (`image_hw`, `fps`, `camera_names`, `val_episodes`)
 - `train_val_*.png` — loss curves (loss, l1, kl)
 
 ### Resume Training
@@ -384,7 +393,7 @@ Hardware: UR robot arm, Weiss CRG 30-050 gripper, Intel RealSense cameras.
 # Install robot dependencies
 uv sync --extra robot
 
-# Dry run — verify full pipeline without sending robot commands
+# Dry run — full pipeline, but the robot is never moved (no homing, no servo commands)
 python inference.py \
     --ckpt_dir checkpoints \
     --robot_ip 192.168.1.10 --dry_run
@@ -396,11 +405,39 @@ python inference.py \
     --cam_exterior <serial> --cam_wrist <serial> \
     --temporal_agg
 
-# Custom frequency and chunk size
+# Custom episode length, headless (no cv2 window)
 python inference.py \
     --ckpt_dir checkpoints \
     --robot_ip 192.168.1.10 \
-    --frequency 10 --chunk_size 50 --max_steps 500
+    --max_steps 500 --no_vis
+```
+
+`inference.py` reads `config.json` from the checkpoint directory and keeps deployment
+consistent with training:
+
+- **Image resolution** — frames are center-cropped to the training aspect ratio and resized to `image_hw`
+- **Control frequency** — defaults to the dataset `fps`; a different `--frequency` logs a warning (motions would play back faster / slower)
+- **Camera order** — follows `camera_names` (matched by the last key segment, e.g. `observation.images.wrist` → `wrist`); a missing camera is an error
+- **State range** — before each episode, the robot's qpos is compared with the training statistics and dimensions more than 5σ away are reported (catches deg/rad or gripper-convention mismatches)
+
+### Evaluation (Open-Loop and Real Robot)
+
+**Open-loop** (no robot): replay the held-out validation episodes (`val_episodes` in `config.json`),
+predict a chunk at every frame and compare with the demonstrated actions in raw units.
+Writes `open_loop_eval.json` (per-joint L1, L1 along the chunk) and one trajectory plot per episode.
+
+```bash
+python eval.py --ckpt_dir checkpoints \
+    --dataset local/ur5_pick_place --data_root ./data/ur5_pick_place
+```
+
+**Closed-loop on the real robot**: run N rollouts; before each one the operator resets the scene,
+after each one they label it success / failure. Videos and an `eval_<timestamp>.json` summary
+(success rate, per-episode results) are written.
+
+```bash
+python inference.py --ckpt_dir checkpoints --robot_ip 192.168.1.10 \
+    --temporal_agg --num_episodes 20 --record_dir eval_videos
 ```
 
 ### Evaluation (ALOHA Simulation)
@@ -447,7 +484,7 @@ python scripts/benchmark_inference.py --device cuda --num_cam 2
 pytest tests/ -v
 ```
 
-40 tests covering normalizer, policy, temporal ensembling, EMA, evaluation rollouts, augmentation, and end-to-end integration.
+53 tests covering normalizer, policy (incl. augmentation and backbone freezing), temporal ensembling, EMA, train/val split, evaluation rollouts and tools, and end-to-end training / resume.
 
 ---
 

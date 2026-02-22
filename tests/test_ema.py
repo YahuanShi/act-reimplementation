@@ -11,7 +11,6 @@ Validates:
 
 import torch
 import torch.nn as nn
-import pytest
 
 from act.model.ema import EMAModel
 

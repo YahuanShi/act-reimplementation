@@ -10,20 +10,26 @@ Tests the complete DETRVAE model to verify:
 """
 
 import torch
+
 from act.model.detr_vae import build_act_model, kl_divergence
 
 
-def make_config(camera_names=None, hidden_dim=256, num_queries=50,
-                state_dim=7, action_dim=7):
+def make_config(camera_names=None, hidden_dim=256, num_queries=50, state_dim=7, action_dim=7):
     """Create a model config dict."""
     if camera_names is None:
-        camera_names = ['cam']
+        camera_names = ["cam"]
     return {
-        'state_dim': state_dim, 'action_dim': action_dim,
-        'hidden_dim': hidden_dim, 'dim_feedforward': 1024,
-        'backbone': 'resnet18', 'lr_backbone': 1e-5,
-        'enc_layers': 4, 'dec_layers': 7, 'nheads': 8,
-        'num_queries': num_queries, 'camera_names': camera_names,
+        "state_dim": state_dim,
+        "action_dim": action_dim,
+        "hidden_dim": hidden_dim,
+        "dim_feedforward": 1024,
+        "backbone": "resnet18",
+        "lr_backbone": 1e-5,
+        "enc_layers": 4,
+        "dec_layers": 7,
+        "nheads": 8,
+        "num_queries": num_queries,
+        "camera_names": camera_names,
     }
 
 
@@ -91,7 +97,7 @@ def test_multi_camera():
     print("Test 3: Multi-Camera Support")
     print("=" * 60)
 
-    config = make_config(camera_names=['cam_left', 'cam_right'])
+    config = make_config(camera_names=["cam_left", "cam_right"])
     model = build_act_model(config)
 
     bs = 2
@@ -118,18 +124,26 @@ def test_different_dims():
     # Single arm robot: 6 joints + 1 gripper = 7
     config = make_config(state_dim=7, action_dim=7)
     model = build_act_model(config)
-    a_hat, _, _ = model(torch.randn(2, 7), torch.randn(2, 1, 3, 240, 320),
-                        None, torch.randn(2, 50, 7),
-                        torch.zeros(2, 50, dtype=torch.bool))
+    a_hat, _, _ = model(
+        torch.randn(2, 7),
+        torch.randn(2, 1, 3, 240, 320),
+        None,
+        torch.randn(2, 50, 7),
+        torch.zeros(2, 50, dtype=torch.bool),
+    )
     print(f"  7-DOF robot: {a_hat.shape}")
     assert a_hat.shape == (2, 50, 7)
 
     # Dual arm robot: 14 joints
     config = make_config(state_dim=14, action_dim=14)
     model = build_act_model(config)
-    a_hat, _, _ = model(torch.randn(2, 14), torch.randn(2, 1, 3, 240, 320),
-                        None, torch.randn(2, 50, 14),
-                        torch.zeros(2, 50, dtype=torch.bool))
+    a_hat, _, _ = model(
+        torch.randn(2, 14),
+        torch.randn(2, 1, 3, 240, 320),
+        None,
+        torch.randn(2, 50, 14),
+        torch.zeros(2, 50, dtype=torch.bool),
+    )
     print(f"  14-DOF robot: {a_hat.shape}")
     assert a_hat.shape == (2, 50, 14)
 
@@ -153,7 +167,7 @@ def test_gradient_flow():
     a_hat, _, (mu, logvar) = model(qpos, image, None, actions, is_pad)
 
     # Compute ACT loss: L1 + KL
-    l1_loss = torch.nn.functional.l1_loss(actions, a_hat, reduction='none')
+    l1_loss = torch.nn.functional.l1_loss(actions, a_hat, reduction="none")
     l1 = (l1_loss * ~is_pad.unsqueeze(-1)).mean()
     total_kl, _, _ = kl_divergence(mu, logvar)
     loss = l1 + 10.0 * total_kl[0]
@@ -161,14 +175,16 @@ def test_gradient_flow():
     loss.backward()
 
     # Check backbone has gradients
-    backbone_grad = sum(1 for p in model.backbones.parameters()
-                        if p.grad is not None and p.grad.abs().sum() > 0)
+    backbone_grad = sum(
+        1 for p in model.backbones.parameters() if p.grad is not None and p.grad.abs().sum() > 0
+    )
     print(f"  Backbone params with gradient: {backbone_grad}")
     assert backbone_grad > 0
 
     # Check CVAE encoder has gradients
-    encoder_grad = sum(1 for p in model.encoder.parameters()
-                       if p.grad is not None and p.grad.abs().sum() > 0)
+    encoder_grad = sum(
+        1 for p in model.encoder.parameters() if p.grad is not None and p.grad.abs().sum() > 0
+    )
     print(f"  CVAE encoder params with gradient: {encoder_grad}")
     assert encoder_grad > 0
 

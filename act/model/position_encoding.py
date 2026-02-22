@@ -23,9 +23,10 @@ Two types of position encoding are used in ACT:
 """
 
 import math
+
+import numpy as np
 import torch
 from torch import nn
-import numpy as np
 
 
 def get_sinusoid_encoding_table(n_position, d_hid):
@@ -52,11 +53,9 @@ def get_sinusoid_encoding_table(n_position, d_hid):
         #   position / 10000^(2*(j//2) / d_hid)
         # This creates a spectrum of frequencies: low-index dims capture
         # fine-grained position info, high-index dims capture coarse info.
-        return [position / np.power(10000, 2 * (hid_j // 2) / d_hid)
-                for hid_j in range(d_hid)]
+        return [position / np.power(10000, 2 * (hid_j // 2) / d_hid) for hid_j in range(d_hid)]
 
-    sinusoid_table = np.array([get_position_angle_vec(pos_i)
-                               for pos_i in range(n_position)])
+    sinusoid_table = np.array([get_position_angle_vec(pos_i) for pos_i in range(n_position)])
 
     # Apply sin to even indices (0, 2, 4, ...) and cos to odd indices (1, 3, 5, ...)
     sinusoid_table[:, 0::2] = np.sin(sinusoid_table[:, 0::2])
@@ -92,8 +91,7 @@ class PositionEmbeddingSine(nn.Module):
         scale: normalization scale (default 2*pi)
     """
 
-    def __init__(self, num_pos_feats=64, temperature=10000, normalize=False,
-                 scale=None):
+    def __init__(self, num_pos_feats=64, temperature=10000, normalize=False, scale=None):
         super().__init__()
         self.num_pos_feats = num_pos_feats
         self.temperature = temperature
@@ -132,8 +130,7 @@ class PositionEmbeddingSine(nn.Module):
 
         # Frequency bands: temperature^(2i / num_pos_feats) for i in [0, num_pos_feats)
         # Lower indices -> higher frequency (fine position), higher indices -> lower frequency
-        dim_t = torch.arange(self.num_pos_feats, dtype=torch.float32,
-                             device=x.device)
+        dim_t = torch.arange(self.num_pos_feats, dtype=torch.float32, device=x.device)
         dim_t = self.temperature ** (2 * (dim_t // 2) / self.num_pos_feats)
 
         # Divide coordinates by frequency bands: shape (1, H, W, num_pos_feats)
@@ -143,13 +140,11 @@ class PositionEmbeddingSine(nn.Module):
         # Apply sin to even dims, cos to odd dims, then interleave and flatten
         # stack(..., dim=4) creates pairs [sin, cos] then flatten merges them
         pos_x = torch.stack(
-            (pos_x[:, :, :, 0::2].sin(), pos_x[:, :, :, 1::2].cos()),
-            dim=4
+            (pos_x[:, :, :, 0::2].sin(), pos_x[:, :, :, 1::2].cos()), dim=4
         ).flatten(3)  # (1, H, W, num_pos_feats)
 
         pos_y = torch.stack(
-            (pos_y[:, :, :, 0::2].sin(), pos_y[:, :, :, 1::2].cos()),
-            dim=4
+            (pos_y[:, :, :, 0::2].sin(), pos_y[:, :, :, 1::2].cos()), dim=4
         ).flatten(3)  # (1, H, W, num_pos_feats)
 
         # Concatenate y and x encodings, then permute to (1, d_model, H, W)

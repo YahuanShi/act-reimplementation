@@ -9,6 +9,7 @@ Tests the LeRobot dataset adapter and normalizer:
 """
 
 import torch
+
 from act.dataset.normalizer import ACTNormalizer
 
 
@@ -22,7 +23,7 @@ def test_normalizer_roundtrip():
 
     # Create synthetic data with known statistics
     actions = torch.randn(100, 7) * 3 + 2  # mean~2, std~3
-    qpos = torch.randn(100, 7) * 0.5 + 1   # mean~1, std~0.5
+    qpos = torch.randn(100, 7) * 0.5 + 1  # mean~1, std~0.5
 
     normalizer.fit_from_tensors(actions, qpos)
 
@@ -56,8 +57,7 @@ def test_normalizer_save_load():
     print("=" * 60)
 
     normalizer = ACTNormalizer()
-    normalizer.fit_from_tensors(
-        torch.randn(50, 7), torch.randn(50, 7))
+    normalizer.fit_from_tensors(torch.randn(50, 7), torch.randn(50, 7))
 
     state = normalizer.state_dict()
     print(f"  State dict keys: {list(state.keys())}")
@@ -93,8 +93,9 @@ def test_normalizer_std_clipping():
     normalizer.fit_from_tensors(actions)
 
     print(f"  Action std: {normalizer.action_std}")
-    assert normalizer.action_std.min().item() >= 0.01 - 1e-6, \
+    assert normalizer.action_std.min().item() >= 0.01 - 1e-6, (
         "Std should be clipped to at least 0.01"
+    )
 
     print("  PASSED\n")
 
@@ -109,9 +110,8 @@ def test_lerobot_dataset():
         from act.dataset.lerobot_wrapper import LeRobotACTDataset
 
         ds = LeRobotACTDataset(
-            repo_id="lerobot/aloha_sim_transfer_cube_human",
-            chunk_size=50,
-            episodes=[0])
+            repo_id="lerobot/aloha_sim_transfer_cube_human", chunk_size=50, episodes=[0]
+        )
 
         print(f"  Dataset length: {len(ds)}")
         print(f"  State dim: {ds.state_dim}")
@@ -125,8 +125,8 @@ def test_lerobot_dataset():
         print(f"  is_pad sum: {sample['is_pad'].sum().item()}")
 
         # Check shapes
-        assert sample['action'].shape[0] == 50, "Action chunk should be chunk_size"
-        assert sample['is_pad'].shape[0] == 50, "is_pad should be chunk_size"
+        assert sample["action"].shape[0] == 50, "Action chunk should be chunk_size"
+        assert sample["is_pad"].shape[0] == 50, "is_pad should be chunk_size"
 
         # Test near end of episode
         last_sample = ds[len(ds) - 1]
@@ -134,6 +134,7 @@ def test_lerobot_dataset():
 
         # Test DataLoader
         from torch.utils.data import DataLoader
+
         loader = DataLoader(ds, batch_size=4, shuffle=True)
         batch = next(iter(loader))
         print(f"  Batch qpos: {batch['qpos'].shape}")

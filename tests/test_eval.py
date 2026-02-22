@@ -97,11 +97,11 @@ def test_crop_random_in_train_center_in_eval():
     image = torch.rand(2, 1, 3, 120, 160)
 
     policy.train()
-    assert policy._normalize_images(image).shape == (2, 1, 3, 100, 140)
+    assert policy._preprocess_images(image).shape == (2, 1, 3, 100, 140)
 
     policy.eval()
-    out1 = policy._normalize_images(image)
-    out2 = policy._normalize_images(image)
+    out1 = policy._preprocess_images(image)
+    out2 = policy._preprocess_images(image)
     assert out1.shape == (2, 1, 3, 100, 140)
     assert torch.equal(out1, out2), "eval mode must be deterministic (center crop, no jitter)"
 

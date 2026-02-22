@@ -8,8 +8,9 @@ Validates:
   - fit_from_tensors is equivalent to computing manually
 """
 
-import torch
 import pytest
+import torch
+
 from act.dataset.normalizer import ACTNormalizer
 
 

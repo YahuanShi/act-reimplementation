@@ -56,8 +56,9 @@ class ACTPolicy(nn.Module):
             Optional keys:
                 latent_dim (default 32), dropout (default 0.1),
                 pre_norm (default False), weight_decay (default 1e-4),
-                crop_size (default None: [h, w] random crop in train mode,
-                    center crop in eval mode),
+                crop_size (default None: [h, w] crop) or crop_ratio (default
+                    1.0 = no crop): random crop in train mode, center crop in
+                    eval mode; crop_size wins if both are set
                 color_jitter (default False: jitter in train mode only)
     """
 
@@ -67,19 +68,27 @@ class ACTPolicy(nn.Module):
         self.kl_weight = config["kl_weight"]
         self.config = config
 
+        # Image augmentation — owned by the policy so that train()/eval() switch
+        # it automatically: random crop + color jitter while training, a
+        # deterministic center crop for validation, the EMA copy and inference.
+        # Defaults are "off" so configs saved before augmentation existed
+        # still rebuild the exact same model.
+        crop_size = config.get("crop_size")
+        crop_ratio = config.get("crop_ratio", 1.0)
+        if crop_size:
+            self.crop = RandomCenterCrop(size=crop_size)
+        elif crop_ratio < 1.0:
+            self.crop = RandomCenterCrop(ratio=crop_ratio)
+        else:
+            self.crop = nn.Identity()
+        self.color_jitter = ColorJitter() if config.get("color_jitter", False) else nn.Identity()
+
         # ImageNet normalization — applied to images before feeding into ResNet.
         # The ResNet backbone was pretrained on ImageNet-normalized images, so
         # we must apply the same normalization at both training and inference.
         self.normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 
-        # Optional augmentation. Both modules switch behaviour on self.training,
-        # so train()/eval() alone picks random crop + jitter vs center crop.
-        # The center crop at eval keeps inference on the same image size as training.
-        crop_size = config.get("crop_size")
-        self.crop = RandomCenterCrop(crop_size) if crop_size else nn.Identity()
-        self.jitter = ColorJitter() if config.get("color_jitter", False) else nn.Identity()
-
-    def compute_loss(self, qpos, image, actions, is_pad):
+    def compute_loss(self, qpos, image, actions, is_pad) -> dict[str, torch.Tensor]:
         """
         Compute the ACT training loss.
 
@@ -92,8 +101,8 @@ class ACTPolicy(nn.Module):
         Returns:
             loss_dict: {'l1': L1 loss, 'kl': KL divergence, 'loss': total loss}
         """
-        # Normalize images with ImageNet statistics
-        image = self._normalize_images(image)
+        # Augment (train mode only) + ImageNet-normalize images
+        image = self._preprocess_images(image)
 
         # Truncate actions to the model's chunk size
         actions = actions[:, : self.model.num_queries]
@@ -119,7 +128,7 @@ class ACTPolicy(nn.Module):
         return loss_dict
 
     @torch.inference_mode()
-    def predict_action(self, qpos, image):
+    def predict_action(self, qpos, image) -> torch.Tensor:
         """
         Predict an action chunk given current observations.
 
@@ -133,11 +142,11 @@ class ACTPolicy(nn.Module):
         Returns:
             a_hat: (bs, num_queries, action_dim) predicted action chunk
         """
-        image = self._normalize_images(image)
+        image = self._preprocess_images(image)
         a_hat, _, _ = self.model(qpos, image, None)
         return a_hat
 
-    def configure_optimizers(self):
+    def configure_optimizers(self) -> torch.optim.AdamW:
         """
         Build an AdamW optimizer with separate learning rates for backbone
         and non-backbone parameters.
@@ -164,30 +173,32 @@ class ACTPolicy(nn.Module):
             else:
                 other_params.append(param)
 
-        param_groups = [
-            {"params": other_params},
-            {"params": backbone_params, "lr": lr_backbone},
-        ]
+        param_groups = [{"params": other_params}]
+        # With lr_backbone=0 the backbone is frozen (requires_grad=False, see
+        # backbone.py), so there is nothing to put in the second group.
+        if backbone_params:
+            param_groups.append({"params": backbone_params, "lr": lr_backbone})
 
         optimizer = torch.optim.AdamW(param_groups, lr=lr, weight_decay=weight_decay)
         return optimizer
 
-    def _normalize_images(self, image):
+    def _preprocess_images(self, image):
         """
-        Apply optional crop/jitter, then ImageNet normalization, to a batch of
-        multi-camera images.
+        Crop / jitter (mode-dependent) and ImageNet-normalize multi-camera images.
 
         Args:
             image: (bs, num_cam, 3, H, W) with values in [0, 1]
 
         Returns:
-            normalized image tensor (bs, num_cam, 3, H', W'); H', W' differ
-            from H, W only when crop_size is set
+            (bs, num_cam, 3, H', W') normalized images; H', W' < H, W when
+            crop_ratio < 1
         """
         bs, num_cam, C, H, W = image.shape
-        # Merge batch and camera dims, apply normalize once, restore shape.
-        # transforms.Normalize operates channel-wise on (..., C, H, W) tensors.
+        # Merge batch and camera dims so every image gets its own random crop /
+        # jitter, then restore the camera dim. Color jitter must run on [0, 1]
+        # pixels, i.e. before ImageNet normalization.
         image = image.reshape(bs * num_cam, C, H, W)
-        image = self.jitter(self.crop(image))
+        image = self.crop(image)
+        image = self.color_jitter(image)
         image = self.normalize(image)
-        return image.view(bs, num_cam, C, *image.shape[-2:])
+        return image.reshape(bs, num_cam, C, *image.shape[-2:])

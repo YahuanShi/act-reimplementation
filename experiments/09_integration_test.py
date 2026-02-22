@@ -20,19 +20,28 @@ import pickle
 import tempfile
 
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader, Dataset
 
-from act.policy.act_policy import ACTPolicy
 from act.dataset.normalizer import ACTNormalizer
-from training.workspace import TrainWorkspace
+from act.policy.act_policy import ACTPolicy
 from inference.temporal_ensemble import InferencePipeline
+from training.workspace import TrainWorkspace
 
 
 class SyntheticDataset(Dataset):
     """Synthetic dataset that generates deterministic patterns for testing."""
 
-    def __init__(self, num_samples=32, state_dim=7, action_dim=7,
-                 chunk_size=20, num_cam=1, img_h=120, img_w=160, seed=42):
+    def __init__(
+        self,
+        num_samples=32,
+        state_dim=7,
+        action_dim=7,
+        chunk_size=20,
+        num_cam=1,
+        img_h=120,
+        img_w=160,
+        seed=42,
+    ):
         self.num_samples = num_samples
         self.state_dim = state_dim
         self.action_dim = action_dim
@@ -45,14 +54,14 @@ class SyntheticDataset(Dataset):
         # Pre-generate all data for reproducibility
         self.data = []
         for _ in range(num_samples):
-            self.data.append({
-                'qpos': torch.randn(state_dim, generator=self.rng),
-                'image': torch.rand(num_cam, 3, img_h, img_w,
-                                    generator=self.rng),
-                'action': torch.randn(chunk_size, action_dim,
-                                      generator=self.rng),
-                'is_pad': torch.zeros(chunk_size, dtype=torch.bool),
-            })
+            self.data.append(
+                {
+                    "qpos": torch.randn(state_dim, generator=self.rng),
+                    "image": torch.rand(num_cam, 3, img_h, img_w, generator=self.rng),
+                    "action": torch.randn(chunk_size, action_dim, generator=self.rng),
+                    "is_pad": torch.zeros(chunk_size, dtype=torch.bool),
+                }
+            )
 
     def __len__(self):
         return self.num_samples
@@ -70,15 +79,24 @@ def test_train_and_save():
     tmpdir = tempfile.mkdtemp()
 
     config = {
-        'state_dim': 7, 'action_dim': 7,
-        'hidden_dim': 128, 'dim_feedforward': 256,
-        'backbone': 'resnet18', 'lr_backbone': 1e-5,
-        'enc_layers': 2, 'dec_layers': 2, 'nheads': 4,
-        'num_queries': 20, 'camera_names': ['cam'],
-        'lr': 1e-4, 'kl_weight': 10.0,
-        'num_epochs': 3, 'batch_size': 4,
-        'ckpt_dir': tmpdir, 'seed': 42,
-        'save_every': 2,
+        "state_dim": 7,
+        "action_dim": 7,
+        "hidden_dim": 128,
+        "dim_feedforward": 256,
+        "backbone": "resnet18",
+        "lr_backbone": 1e-5,
+        "enc_layers": 2,
+        "dec_layers": 2,
+        "nheads": 4,
+        "num_queries": 20,
+        "camera_names": ["cam"],
+        "lr": 1e-4,
+        "kl_weight": 10.0,
+        "num_epochs": 3,
+        "batch_size": 4,
+        "ckpt_dir": tmpdir,
+        "seed": 42,
+        "save_every": 2,
     }
 
     train_ds = SyntheticDataset(num_samples=16, chunk_size=20, seed=42)
@@ -95,9 +113,9 @@ def test_train_and_save():
     print(f"  Best epoch: {best_epoch}, loss: {best_loss:.4f}")
 
     # Verify all expected files exist
-    assert os.path.exists(os.path.join(tmpdir, 'policy_best.ckpt'))
-    assert os.path.exists(os.path.join(tmpdir, 'policy_last.ckpt'))
-    assert os.path.exists(os.path.join(tmpdir, 'dataset_stats.pkl'))
+    assert os.path.exists(os.path.join(tmpdir, "policy_best.ckpt"))
+    assert os.path.exists(os.path.join(tmpdir, "policy_last.ckpt"))
+    assert os.path.exists(os.path.join(tmpdir, "dataset_stats.pkl"))
     print("  All checkpoint files saved successfully")
     print("  PASSED\n")
 
@@ -110,18 +128,18 @@ def test_load_and_infer(tmpdir, config):
     print("Test 2: Load Checkpoint and Infer")
     print("=" * 60)
 
-    ckpt_path = os.path.join(tmpdir, 'policy_best.ckpt')
-    stats_path = os.path.join(tmpdir, 'dataset_stats.pkl')
+    ckpt_path = os.path.join(tmpdir, "policy_best.ckpt")
+    stats_path = os.path.join(tmpdir, "dataset_stats.pkl")
 
     # Load normalizer from saved stats
-    with open(stats_path, 'rb') as f:
+    with open(stats_path, "rb") as f:
         stats = pickle.load(f)
     normalizer = ACTNormalizer()
     normalizer.load_state_dict(stats)
     print("  Normalizer loaded from stats file")
 
     # Load policy from checkpoint
-    state_dict = torch.load(ckpt_path, map_location='cpu', weights_only=True)
+    state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=True)
     policy = ACTPolicy(config)
     policy.load_state_dict(state_dict)
     policy.eval()
@@ -151,14 +169,19 @@ def test_inference_pipeline(policy, normalizer, config):
     print("Test 3: InferencePipeline End-to-End")
     print("=" * 60)
 
-    chunk_size = config['num_queries']
-    action_dim = config['action_dim']
-    state_dim = config['state_dim']
+    chunk_size = config["num_queries"]
+    action_dim = config["action_dim"]
+    state_dim = config["state_dim"]
 
     # --- Mode 1: Without temporal ensembling ---
     pipeline_no_agg = InferencePipeline(
-        policy, normalizer, chunk_size=chunk_size,
-        temporal_agg=False, max_timesteps=50, device='cpu')
+        policy,
+        normalizer,
+        chunk_size=chunk_size,
+        temporal_agg=False,
+        max_timesteps=50,
+        device="cpu",
+    )
     pipeline_no_agg.reset()
 
     torch.manual_seed(0)
@@ -176,8 +199,8 @@ def test_inference_pipeline(policy, normalizer, config):
 
     # --- Mode 2: With temporal ensembling ---
     pipeline_agg = InferencePipeline(
-        policy, normalizer, chunk_size=chunk_size,
-        temporal_agg=True, max_timesteps=50, device='cpu')
+        policy, normalizer, chunk_size=chunk_size, temporal_agg=True, max_timesteps=50, device="cpu"
+    )
     pipeline_agg.reset()
 
     torch.manual_seed(0)
@@ -196,7 +219,7 @@ def test_inference_pipeline(policy, normalizer, config):
     def avg_step_diff(actions, start=5):
         diffs = []
         for i in range(start, len(actions) - 1):
-            diffs.append(torch.norm(actions[i+1] - actions[i]).item())
+            diffs.append(torch.norm(actions[i + 1] - actions[i]).item())
         return sum(diffs) / len(diffs)
 
     diff_no_agg = avg_step_diff(actions_no_agg)
@@ -213,52 +236,53 @@ def test_config_inference_from_checkpoint(tmpdir, original_config):
     print("Test 4: Config Inference from Checkpoint")
     print("=" * 60)
 
-    ckpt_path = os.path.join(tmpdir, 'policy_best.ckpt')
-    state_dict = torch.load(ckpt_path, map_location='cpu', weights_only=True)
+    ckpt_path = os.path.join(tmpdir, "policy_best.ckpt")
+    state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=True)
 
     # Infer key dimensions from state_dict (matching eval.py logic)
-    query_embed = state_dict['model.query_embed.weight']
+    query_embed = state_dict["model.query_embed.weight"]
     num_queries = query_embed.shape[0]
     hidden_dim = query_embed.shape[1]
-    action_dim = state_dict['model.action_head.weight'].shape[0]
-    state_dim = state_dict['model.encoder_joint_proj.weight'].shape[1]
+    action_dim = state_dict["model.action_head.weight"].shape[0]
+    state_dim = state_dict["model.encoder_joint_proj.weight"].shape[1]
 
-    enc_layers = sum(1 for k in state_dict
-                     if 'transformer.encoder.layers' in k
-                     and 'self_attn.in_proj_weight' in k)
-    dec_layers = sum(1 for k in state_dict if 'transformer.decoder.layers' in k
-                     and 'self_attn.in_proj_weight' in k)
+    enc_layers = sum(
+        1
+        for k in state_dict
+        if "transformer.encoder.layers" in k and "self_attn.in_proj_weight" in k
+    )
+    dec_layers = sum(
+        1
+        for k in state_dict
+        if "transformer.decoder.layers" in k and "self_attn.in_proj_weight" in k
+    )
 
-    print(f"  Inferred num_queries: {num_queries} "
-          f"(expected {original_config['num_queries']})")
-    print(f"  Inferred hidden_dim:  {hidden_dim} "
-          f"(expected {original_config['hidden_dim']})")
-    print(f"  Inferred action_dim:  {action_dim} "
-          f"(expected {original_config['action_dim']})")
-    print(f"  Inferred state_dim:   {state_dim} "
-          f"(expected {original_config['state_dim']})")
-    print(f"  Inferred enc_layers:  {enc_layers} "
-          f"(expected {original_config['enc_layers']})")
-    print(f"  Inferred dec_layers:  {dec_layers} "
-          f"(expected {original_config['dec_layers']})")
+    print(f"  Inferred num_queries: {num_queries} (expected {original_config['num_queries']})")
+    print(f"  Inferred hidden_dim:  {hidden_dim} (expected {original_config['hidden_dim']})")
+    print(f"  Inferred action_dim:  {action_dim} (expected {original_config['action_dim']})")
+    print(f"  Inferred state_dim:   {state_dim} (expected {original_config['state_dim']})")
+    print(f"  Inferred enc_layers:  {enc_layers} (expected {original_config['enc_layers']})")
+    print(f"  Inferred dec_layers:  {dec_layers} (expected {original_config['dec_layers']})")
 
-    assert num_queries == original_config['num_queries']
-    assert hidden_dim == original_config['hidden_dim']
-    assert action_dim == original_config['action_dim']
-    assert state_dim == original_config['state_dim']
-    assert enc_layers == original_config['enc_layers']
-    assert dec_layers == original_config['dec_layers']
+    assert num_queries == original_config["num_queries"]
+    assert hidden_dim == original_config["hidden_dim"]
+    assert action_dim == original_config["action_dim"]
+    assert state_dim == original_config["state_dim"]
+    assert enc_layers == original_config["enc_layers"]
+    assert dec_layers == original_config["dec_layers"]
 
     # Verify the inferred config can build a model that loads the checkpoint
     inferred_config = dict(original_config)
-    inferred_config.update({
-        'num_queries': num_queries,
-        'hidden_dim': hidden_dim,
-        'action_dim': action_dim,
-        'state_dim': state_dim,
-        'enc_layers': enc_layers,
-        'dec_layers': dec_layers,
-    })
+    inferred_config.update(
+        {
+            "num_queries": num_queries,
+            "hidden_dim": hidden_dim,
+            "action_dim": action_dim,
+            "state_dim": state_dim,
+            "enc_layers": enc_layers,
+            "dec_layers": dec_layers,
+        }
+    )
 
     policy = ACTPolicy(inferred_config)
     policy.load_state_dict(state_dict)
@@ -272,10 +296,10 @@ def test_normalizer_roundtrip(tmpdir):
     print("Test 5: Normalizer Save/Load Roundtrip")
     print("=" * 60)
 
-    stats_path = os.path.join(tmpdir, 'dataset_stats.pkl')
+    stats_path = os.path.join(tmpdir, "dataset_stats.pkl")
 
     # Load saved stats
-    with open(stats_path, 'rb') as f:
+    with open(stats_path, "rb") as f:
         stats = pickle.load(f)
 
     # Create normalizer from stats

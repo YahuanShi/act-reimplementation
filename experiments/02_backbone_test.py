@@ -9,7 +9,8 @@ Tests the ResNet18 visual backbone to verify:
 """
 
 import torch
-from act.model.backbone import build_backbone, FrozenBatchNorm2d
+
+from act.model.backbone import FrozenBatchNorm2d, build_backbone
 
 
 def test_feature_map_dimensions():
@@ -18,7 +19,7 @@ def test_feature_map_dimensions():
     print("Test 1: Feature Map Dimensions")
     print("=" * 60)
 
-    backbone = build_backbone('resnet18', hidden_dim=256)
+    backbone = build_backbone("resnet18", hidden_dim=256)
 
     test_cases = [
         # (H, W) -> expected (H/32, W/32)
@@ -37,10 +38,8 @@ def test_feature_map_dimensions():
         print(f"    Feature: {feat.shape} (expected (2, 512, {eH}, {eW}))")
         print(f"    Pos enc: {p.shape} (expected (1, 256, {eH}, {eW}))")
 
-        assert feat.shape == (2, 512, eH, eW), \
-            f"Expected (2, 512, {eH}, {eW}), got {feat.shape}"
-        assert p.shape == (1, 256, eH, eW), \
-            f"Expected (1, 256, {eH}, {eW}), got {p.shape}"
+        assert feat.shape == (2, 512, eH, eW), f"Expected (2, 512, {eH}, {eW}), got {feat.shape}"
+        assert p.shape == (1, 256, eH, eW), f"Expected (1, 256, {eH}, {eW}), got {p.shape}"
 
     print("  PASSED\n")
 
@@ -61,7 +60,7 @@ def test_frozen_batchnorm():
     # Should have 4 buffers
     buffers = dict(fbn.named_buffers())
     print(f"  Buffers: {list(buffers.keys())}")
-    assert set(buffers.keys()) == {'weight', 'bias', 'running_mean', 'running_var'}
+    assert set(buffers.keys()) == {"weight", "bias", "running_mean", "running_var"}
 
     # Forward pass should work
     x = torch.randn(2, 64, 8, 8)
@@ -77,7 +76,7 @@ def test_backbone_gradients():
     print("Test 3: Backbone Gradient Flow")
     print("=" * 60)
 
-    backbone = build_backbone('resnet18', hidden_dim=256, lr_backbone=1e-5)
+    backbone = build_backbone("resnet18", hidden_dim=256, lr_backbone=1e-5)
 
     img = torch.randn(2, 3, 240, 320, requires_grad=True)
     features, pos = backbone(img)

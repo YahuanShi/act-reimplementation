@@ -18,9 +18,8 @@ forward passes with dummy data and checking output shapes. It tests:
 """
 
 import torch
-from act.model.transformer import (
-    TransformerEncoder, TransformerEncoderLayer, Transformer
-)
+
+from act.model.transformer import Transformer, TransformerEncoder, TransformerEncoderLayer
 
 
 def test_cvae_encoder():
@@ -53,8 +52,9 @@ def test_cvae_encoder():
 
     print(f"  Input shape:  {src.shape}")
     print(f"  Output shape: {output.shape}")
-    assert output.shape == (seq_len, bs, d_model), \
+    assert output.shape == (seq_len, bs, d_model), (
         f"Expected ({seq_len}, {bs}, {d_model}), got {output.shape}"
+    )
 
     # The CLS token output (index 0) will be used for mu/logvar
     cls_output = output[0]
@@ -78,10 +78,12 @@ def test_full_transformer():
     H, W = 15, 20
 
     transformer = Transformer(
-        d_model=d_model, nhead=nhead,
-        num_encoder_layers=4, num_decoder_layers=4,
+        d_model=d_model,
+        nhead=nhead,
+        num_encoder_layers=4,
+        num_decoder_layers=4,
         dim_feedforward=1024,
-        return_intermediate_dec=True
+        return_intermediate_dec=True,
     )
 
     # Image features from backbone
@@ -96,14 +98,16 @@ def test_full_transformer():
     proprio_input = torch.randn(bs, d_model)
     additional_pos_embed = torch.randn(2, d_model)
 
-    hs = transformer(src, None, query_embed, pos_embed,
-                     latent_input, proprio_input, additional_pos_embed)
+    hs = transformer(
+        src, None, query_embed, pos_embed, latent_input, proprio_input, additional_pos_embed
+    )
 
     print(f"  Image features: {src.shape}")
     print(f"  Output shape:   {hs.shape}")
     # (num_dec_layers, bs, num_queries, d_model)
-    assert hs.shape == (4, bs, num_queries, d_model), \
+    assert hs.shape == (4, bs, num_queries, d_model), (
         f"Expected (4, {bs}, {num_queries}, {d_model}), got {hs.shape}"
+    )
 
     # In practice, only the last layer output is used
     last_layer = hs[0]
@@ -121,10 +125,12 @@ def test_gradient_flow():
 
     d_model = 128
     transformer = Transformer(
-        d_model=d_model, nhead=4,
-        num_encoder_layers=2, num_decoder_layers=2,
+        d_model=d_model,
+        nhead=4,
+        num_encoder_layers=2,
+        num_decoder_layers=2,
         dim_feedforward=256,
-        return_intermediate_dec=True
+        return_intermediate_dec=True,
     )
 
     src = torch.randn(2, d_model, 4, 6, requires_grad=True)
@@ -149,8 +155,9 @@ def test_gradient_flow():
     # feeds into the decoder). Some decoder parameters in later layers may
     # not have gradients when only hs[0] (first layer output) is used — this
     # is expected with return_intermediate=True.
-    has_grad = sum(1 for p in transformer.parameters()
-                   if p.grad is not None and p.grad.abs().sum() > 0)
+    has_grad = sum(
+        1 for p in transformer.parameters() if p.grad is not None and p.grad.abs().sum() > 0
+    )
     total = sum(1 for p in transformer.parameters() if p.requires_grad)
     print(f"  Parameters with gradient: {has_grad}/{total}")
     assert has_grad > 0, "No parameters received gradients"

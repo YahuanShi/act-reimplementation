@@ -6,11 +6,13 @@ Validates:
   - predict_action output shape matches (batch, num_queries, action_dim)
   - is_pad masking correctly ignores padded timesteps in the L1 loss
   - optimizer has two param groups with different learning rates
+  - lr_backbone=0 really freezes the backbone
+  - augmentation: random crop/jitter in train mode, deterministic center crop in eval
   - one gradient step decreases the loss
 """
 
 import torch
-import pytest
+
 from act.policy.act_policy import ACTPolicy
 
 
@@ -95,15 +97,48 @@ def test_loss_decreases_after_step():
     batch = make_batch()
     opt = policy.configure_optimizers()
 
-    info_before = policy.compute_loss(batch["qpos"], batch["image"], batch["action"], batch["is_pad"])
+    info_before = policy.compute_loss(
+        batch["qpos"], batch["image"], batch["action"], batch["is_pad"]
+    )
     info_before["loss"].backward()
     opt.step()
     opt.zero_grad()
 
-    info_after = policy.compute_loss(batch["qpos"], batch["image"], batch["action"], batch["is_pad"])
+    info_after = policy.compute_loss(
+        batch["qpos"], batch["image"], batch["action"], batch["is_pad"]
+    )
     assert info_after["loss"].item() < info_before["loss"].item(), (
         "loss should decrease after one gradient step"
     )
+
+
+def test_lr_backbone_zero_freezes_backbone():
+    policy = make_policy()
+    policy.config["lr_backbone"] = 0
+    frozen = ACTPolicy(policy.config)
+    backbone_params = [p for n, p in frozen.model.named_parameters() if "backbones" in n]
+    assert backbone_params and not any(p.requires_grad for p in backbone_params)
+    opt = frozen.configure_optimizers()
+    assert len(opt.param_groups) == 1, "frozen backbone must not get an optimizer group"
+
+
+def test_augmentation_train_vs_eval():
+    policy = make_policy()
+    policy.config.update(crop_ratio=0.9, color_jitter=True)
+    policy = ACTPolicy(policy.config)
+    image = torch.rand(2, 1, 3, 120, 160)
+
+    # Training: random crop to 90% of each side, independent per image
+    policy.train()
+    out = policy._preprocess_images(image)
+    assert out.shape == (2, 1, 3, 108, 144)
+
+    # Eval: deterministic center crop, no jitter
+    policy.eval()
+    e1 = policy._preprocess_images(image)
+    e2 = policy._preprocess_images(image)
+    assert e1.shape == (2, 1, 3, 108, 144)
+    assert torch.equal(e1, e2), "eval preprocessing must be deterministic"
 
 
 def test_multi_camera():

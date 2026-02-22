@@ -16,18 +16,26 @@ import os
 import tempfile
 
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader, Dataset
 
-from act.policy.act_policy import ACTPolicy
 from act.dataset.normalizer import ACTNormalizer
+from act.policy.act_policy import ACTPolicy
 from training.workspace import TrainWorkspace
 
 
 class SyntheticACTDataset(Dataset):
     """Synthetic dataset for smoke testing the training pipeline."""
 
-    def __init__(self, num_samples=32, state_dim=7, action_dim=7,
-                 chunk_size=20, num_cam=1, img_h=120, img_w=160):
+    def __init__(
+        self,
+        num_samples=32,
+        state_dim=7,
+        action_dim=7,
+        chunk_size=20,
+        num_cam=1,
+        img_h=120,
+        img_w=160,
+    ):
         self.num_samples = num_samples
         self.state_dim = state_dim
         self.action_dim = action_dim
@@ -41,10 +49,10 @@ class SyntheticACTDataset(Dataset):
 
     def __getitem__(self, idx):
         return {
-            'qpos': torch.randn(self.state_dim),
-            'image': torch.rand(self.num_cam, 3, self.img_h, self.img_w),
-            'action': torch.randn(self.chunk_size, self.action_dim),
-            'is_pad': torch.zeros(self.chunk_size, dtype=torch.bool),
+            "qpos": torch.randn(self.state_dim),
+            "image": torch.rand(self.num_cam, 3, self.img_h, self.img_w),
+            "action": torch.randn(self.chunk_size, self.action_dim),
+            "is_pad": torch.zeros(self.chunk_size, dtype=torch.bool),
         }
 
 
@@ -56,15 +64,24 @@ def test_training_smoke():
 
     with tempfile.TemporaryDirectory() as tmpdir:
         config = {
-            'state_dim': 7, 'action_dim': 7,
-            'hidden_dim': 128, 'dim_feedforward': 256,
-            'backbone': 'resnet18', 'lr_backbone': 1e-5,
-            'enc_layers': 2, 'dec_layers': 2, 'nheads': 4,
-            'num_queries': 20, 'camera_names': ['cam'],
-            'lr': 1e-4, 'kl_weight': 10.0,
-            'num_epochs': 5, 'batch_size': 4,
-            'ckpt_dir': tmpdir, 'seed': 42,
-            'save_every': 2,
+            "state_dim": 7,
+            "action_dim": 7,
+            "hidden_dim": 128,
+            "dim_feedforward": 256,
+            "backbone": "resnet18",
+            "lr_backbone": 1e-5,
+            "enc_layers": 2,
+            "dec_layers": 2,
+            "nheads": 4,
+            "num_queries": 20,
+            "camera_names": ["cam"],
+            "lr": 1e-4,
+            "kl_weight": 10.0,
+            "num_epochs": 5,
+            "batch_size": 4,
+            "ckpt_dir": tmpdir,
+            "seed": 42,
+            "save_every": 2,
         }
 
         # Create synthetic data
@@ -75,8 +92,7 @@ def test_training_smoke():
 
         # Create normalizer
         normalizer = ACTNormalizer()
-        normalizer.fit_from_tensors(
-            torch.randn(100, 7), torch.randn(100, 7))
+        normalizer.fit_from_tensors(torch.randn(100, 7), torch.randn(100, 7))
 
         # Run training
         workspace = TrainWorkspace(config)
@@ -85,19 +101,19 @@ def test_training_smoke():
         # Verify best checkpoint was found
         best_epoch, best_loss, best_state = best_info
         print(f"\n  Best epoch: {best_epoch}, loss: {best_loss:.4f}")
-        assert best_loss < float('inf'), "Should have found a best checkpoint"
+        assert best_loss < float("inf"), "Should have found a best checkpoint"
 
         # Verify files were saved
-        assert os.path.exists(os.path.join(tmpdir, 'policy_best.ckpt'))
-        assert os.path.exists(os.path.join(tmpdir, 'policy_last.ckpt'))
-        assert os.path.exists(os.path.join(tmpdir, 'dataset_stats.pkl'))
+        assert os.path.exists(os.path.join(tmpdir, "policy_best.ckpt"))
+        assert os.path.exists(os.path.join(tmpdir, "policy_last.ckpt"))
+        assert os.path.exists(os.path.join(tmpdir, "dataset_stats.pkl"))
         print("  Checkpoint files: OK")
 
         # Verify checkpoint loads correctly
         policy = ACTPolicy(config)
         policy.load_state_dict(
-            torch.load(os.path.join(tmpdir, 'policy_best.ckpt'),
-                        weights_only=True))
+            torch.load(os.path.join(tmpdir, "policy_best.ckpt"), weights_only=True)
+        )
         print("  Checkpoint loading: OK")
 
         # Verify inference works with loaded checkpoint
@@ -109,7 +125,7 @@ def test_training_smoke():
         assert a_hat.shape == (1, 20, 7)
 
         # Verify training plots were saved
-        plot_files = [f for f in os.listdir(tmpdir) if f.endswith('.png')]
+        plot_files = [f for f in os.listdir(tmpdir) if f.endswith(".png")]
         print(f"  Training plots: {len(plot_files)} files")
 
         print("\n  PASSED")

@@ -11,12 +11,24 @@ Usage:
   # Pipeline smoke test without a simulator (random observations)
   python eval.py --ckpt_dir checkpoints --env mock --n_episodes 2
 
-This script:
-1. Loads a trained ACT policy checkpoint and normalizer stats
-2. Rolls out n_episodes in the chosen environment via EvalRunner
-3. Reports the success rate, saves rollout videos and eval_results.json
+  # Open-loop evaluation on held-out demonstrations (no robot / simulator needed)
+  python eval.py --ckpt_dir checkpoints --dataset local/ur5_pick_place \\
+                 --data_root ./data/ur5_pick_place
 
-For real robot deployment use inference.py, which reuses load_policy().
+This script:
+1. Loads a trained ACT policy checkpoint and normalizer stats (load_policy)
+2. Without --dataset: rolls out n_episodes in the chosen environment via
+   EvalRunner, reports the success rate, saves rollout videos and
+   eval_results.json
+3. With --dataset: replays the validation episodes recorded in config.json,
+   predicts an action chunk at every frame and reports the L1 error against
+   the demonstrated actions in raw units (per joint, first step and full
+   chunk), plus trajectory plots. This is open-loop — it says nothing about
+   compounding errors, but catches broken checkpoints, wrong normalization
+   and overfitting before touching the robot.
+
+For closed-loop real robot evaluation (success rate, videos), use
+  python inference.py ... --num_episodes N --record_dir videos
 """
 
 import argparse
@@ -25,6 +37,7 @@ import os
 import pickle
 
 import av
+import numpy as np
 import torch
 
 from act.dataset.normalizer import ACTNormalizer
@@ -184,6 +197,90 @@ def save_video(frames, path, fps):
         container.mux(stream.encode())
 
 
+@torch.inference_mode()
+def open_loop_eval(pipeline, config, dataset, episodes, out_dir, batch_size=32):
+    """
+    Open-loop evaluation: predict a chunk at every frame of each episode and
+    compare with the demonstrated actions.
+
+    Args:
+        pipeline: InferencePipeline from load_policy() (provides policy + normalizer)
+        config: model config dict
+        dataset: LeRobotACTDataset restricted to the episodes to evaluate
+        episodes: list of episode ids (for reporting)
+        out_dir: where to write open_loop_eval.json and plots
+
+    Returns:
+        metrics dict (raw action units)
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from torch.utils.data import DataLoader
+
+    policy, normalizer, device = pipeline.policy, pipeline.normalizer, pipeline.device
+    policy.eval()
+    chunk = config["num_queries"]
+
+    ep_ids = np.array(dataset.episode_indices)
+    abs_err_sum = 0.0  # (chunk, action_dim) running sum of |error| over valid steps
+    valid_count = 0.0
+    first_pred, first_gt = [], []
+
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=2)
+    for batch in loader:
+        qpos = normalizer.normalize_qpos(batch["qpos"].to(device))
+        image = batch["image"].to(device)
+        gt = batch["action"][:, :chunk].to(device)  # raw units
+        valid = (~batch["is_pad"][:, :chunk]).to(device).float().unsqueeze(-1)
+
+        pred = normalizer.denormalize_action(policy.predict_action(qpos, image))
+        abs_err_sum = abs_err_sum + ((pred - gt).abs() * valid).sum(0)
+        valid_count = valid_count + valid.sum(0)
+        first_pred.append(pred[:, 0].cpu())
+        first_gt.append(gt[:, 0].cpu())
+
+    l1 = (abs_err_sum / valid_count.clamp(min=1)).cpu()  # (chunk, action_dim)
+    first_pred = torch.cat(first_pred).numpy()
+    first_gt = torch.cat(first_gt).numpy()
+
+    metrics = {
+        "episodes": [int(e) for e in episodes],
+        "n_frames": len(dataset),
+        "l1_first_step_per_dim": l1[0].tolist(),
+        "l1_chunk_per_dim": l1.mean(0).tolist(),
+        "l1_first_step": l1[0].mean().item(),
+        "l1_chunk": l1.mean().item(),
+        # How error grows along the chunk — a steep curve means late chunk
+        # steps are unreliable (relevant when executing chunks without ensembling)
+        "l1_by_chunk_step": l1.mean(1).tolist(),
+    }
+
+    os.makedirs(out_dir, exist_ok=True)
+    with open(os.path.join(out_dir, "open_loop_eval.json"), "w") as f:
+        json.dump(metrics, f, indent=2)
+
+    # Per-episode plot: predicted first action vs demonstration, one subplot per dim
+    action_dim = first_gt.shape[1]
+    for ep in episodes:
+        mask = ep_ids == ep
+        fig, axes = plt.subplots(action_dim, 1, figsize=(8, 1.6 * action_dim), sharex=True)
+        axes = np.atleast_1d(axes)
+        for d in range(action_dim):
+            axes[d].plot(first_gt[mask, d], label="demo", lw=1.2)
+            axes[d].plot(first_pred[mask, d], label="policy", lw=1.0, alpha=0.8)
+            axes[d].set_ylabel(f"a{d}")
+        axes[0].legend(loc="upper right")
+        axes[-1].set_xlabel("frame")
+        fig.suptitle(f"Episode {ep} — open-loop first-step prediction")
+        fig.tight_layout()
+        fig.savefig(os.path.join(out_dir, f"open_loop_ep{ep}.png"))
+        plt.close(fig)
+
+    return metrics
+
+
 def main(args):
     device = args.device
     if device == "cuda" and not torch.cuda.is_available():
@@ -204,8 +301,32 @@ def main(args):
     print(f"  Chunk size: {config['num_queries']}")
     print(f"  Cameras: {config['camera_names']}")
     print(f"  Temporal ensembling: {args.temporal_agg}")
-    print(f"\nEvaluating {args.n_episodes} episodes in {args.env} ({args.task})...")
 
+    if args.dataset:
+        from act.dataset.lerobot_wrapper import LeRobotACTDataset
+
+        episodes = args.episodes or config.get("val_episodes")
+        if not episodes:
+            raise SystemExit("No --episodes given and config.json has no val_episodes")
+        dataset = LeRobotACTDataset(
+            repo_id=args.dataset,
+            root=args.data_root,
+            episodes=episodes,
+            chunk_size=config["num_queries"],
+            image_keys=config["camera_names"],
+        )
+        out_dir = args.out_dir or os.path.join(args.ckpt_dir, "open_loop_eval")
+        print(f"\nOpen-loop evaluation on episodes {episodes} ({len(dataset)} frames)...")
+        m = open_loop_eval(pipeline, config, dataset, episodes, out_dir)
+        print(f"  L1 first step : {m['l1_first_step']:.4f}")
+        print(f"  L1 full chunk : {m['l1_chunk']:.4f}")
+        print(
+            "  L1 per dim (first step): " + " ".join(f"{v:.4f}" for v in m["l1_first_step_per_dim"])
+        )
+        print(f"  Results and plots: {out_dir}")
+        return
+
+    print(f"\nEvaluating {args.n_episodes} episodes in {args.env} ({args.task})...")
     runner = EvalRunner(
         env_factory=make_env_factory(args, config),
         policy=pipeline.policy,
@@ -256,10 +377,26 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=1000, help="Episode i is reset with seed+i")
     parser.add_argument("--num_videos", type=int, default=5, help="Save videos of first N episodes")
     parser.add_argument("--fps", type=int, default=50, help="Video fps (ALOHA sim runs at 50 Hz)")
-    parser.add_argument("--out_dir", type=str, default=None, help="Default: <ckpt_dir>/eval_*")
+    parser.add_argument(
+        "--out_dir",
+        type=str,
+        default=None,
+        help="Default: <ckpt_dir>/eval_* (rollouts) or <ckpt_dir>/open_loop_eval (--dataset)",
+    )
     parser.add_argument("--temporal_agg", action="store_true", help="Use temporal ensembling")
     parser.add_argument("--max_timesteps", type=int, default=400, help="Episode length cap")
     parser.add_argument("--k", type=float, default=0.01, help="Temporal ensembling decay constant")
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument(
+        "--dataset", type=str, default=None, help="LeRobot repo_id for open-loop evaluation"
+    )
+    parser.add_argument("--data_root", type=str, default=None, help="Local dataset root")
+    parser.add_argument(
+        "--episodes",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Episodes to evaluate (default: val_episodes from config.json)",
+    )
 
     main(parser.parse_args())
