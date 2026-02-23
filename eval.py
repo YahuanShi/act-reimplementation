@@ -8,6 +8,9 @@ Usage:
   # Same with temporal ensembling
   python eval.py --ckpt_dir checkpoints --env aloha --temporal_agg
 
+  # Shared Franka simulation (robot-sim repo, robosuite) — same seeds as the DP repo
+  python eval.py --ckpt_dir checkpoints/lift --env franka --task lift --temporal_agg
+
   # Pipeline smoke test without a simulator (random observations)
   python eval.py --ckpt_dir checkpoints --env mock --n_episodes 2
 
@@ -326,6 +329,28 @@ def main(args):
         print(f"  Results and plots: {out_dir}")
         return
 
+    if args.env == "franka":
+        from evaluation.franka_sim import evaluate_franka
+
+        out_dir = args.out_dir or os.path.join(
+            args.ckpt_dir, f"eval_franka_{args.task}_{'tagg' if args.temporal_agg else 'chunk'}"
+        )
+        os.makedirs(out_dir, exist_ok=True)
+        evaluate_franka(
+            pipeline,
+            config,
+            task=args.task,
+            n_episodes=args.n_episodes,
+            start_seed=args.seed,
+            image_size=args.image_size,
+            video_dir=os.path.join(out_dir, "videos") if args.num_videos else None,
+            output_json=os.path.join(out_dir, "eval_results.json"),
+            max_steps=args.max_timesteps,
+            n_videos=args.num_videos,
+        )
+        print(f"Results and videos saved to {out_dir}")
+        return
+
     print(f"\nEvaluating {args.n_episodes} episodes in {args.env} ({args.task})...")
     runner = EvalRunner(
         env_factory=make_env_factory(args, config),
@@ -366,15 +391,26 @@ if __name__ == "__main__":
         required=True,
         help="Directory with policy_best.ckpt and dataset_stats.pkl",
     )
-    parser.add_argument("--env", choices=["aloha", "mock"], default="aloha")
+    parser.add_argument("--env", choices=["aloha", "franka", "mock"], default="aloha")
     parser.add_argument(
         "--task",
         type=str,
-        default="AlohaTransferCube-v0",
-        help="gym-aloha task: AlohaTransferCube-v0 or AlohaInsertion-v0",
+        default=None,
+        help="aloha: AlohaTransferCube-v0 (default) or AlohaInsertion-v0; franka: lift (default) or can",
     )
     parser.add_argument("--n_episodes", type=int, default=50)
-    parser.add_argument("--seed", type=int, default=1000, help="Episode i is reset with seed+i")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Episode i is reset with seed+i (default: 1000 aloha, 100000 franka = robot_sim default)",
+    )
+    parser.add_argument(
+        "--image_size",
+        type=int,
+        default=84,
+        help="franka: camera resolution the policy was trained on",
+    )
     parser.add_argument("--num_videos", type=int, default=5, help="Save videos of first N episodes")
     parser.add_argument("--fps", type=int, default=50, help="Video fps (ALOHA sim runs at 50 Hz)")
     parser.add_argument(
@@ -399,4 +435,9 @@ if __name__ == "__main__":
         help="Episodes to evaluate (default: val_episodes from config.json)",
     )
 
-    main(parser.parse_args())
+    args = parser.parse_args()
+    if args.task is None:
+        args.task = {"aloha": "AlohaTransferCube-v0", "franka": "lift"}.get(args.env, "mock")
+    if args.seed is None:
+        args.seed = 100_000 if args.env == "franka" else 1000
+    main(args)

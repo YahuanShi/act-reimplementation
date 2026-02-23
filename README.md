@@ -14,6 +14,7 @@ A from-scratch reimplementation of [Action Chunking with Transformers (ACT)](htt
 - [ ] **Demo** — Add demo GIF / video of real robot pick-and-place deployment
 - [ ] **Checkpoints** — Release trained checkpoints with download link
 - [ ] **Sim results** — Train on ALOHA TransferCube and report success rate (paper: ~90% scripted, ~50% human data)
+- [ ] **Franka sim results** — ACT vs Diffusion Policy on robomimic Lift / Can in the shared [`robot-sim`](../robot-sim) environment (same seeds)
 - [ ] **Results** — Report open-loop error (`eval.py --dataset`) and real-robot success rate (`inference.py --num_episodes`)
 
 ---
@@ -247,7 +248,8 @@ Input:
 │   └── temporal_ensemble.py        # InferencePipeline with temporal ensembling
 ├── evaluation/
 │   ├── runner.py                   # Rollout runner (success via info['is_success']) + mock env
-│   └── aloha_env.py                # gym-aloha (MuJoCo) adapter → ACT observation format
+│   ├── aloha_env.py                # gym-aloha (MuJoCo) adapter → ACT observation format
+│   └── franka_sim.py               # Adapter for the shared Franka simulation (../robot-sim)
 ├── tests/
 │   ├── test_policy.py              # ACTPolicy loss and inference shape tests
 │   ├── test_normalizer.py          # Normalizer fit, normalize, denormalize
@@ -463,6 +465,31 @@ An episode is a success when the env reports `info["is_success"]` (TransferCube:
 reward 4 — cube held by the left gripper, off the table). Episode `i` resets with
 `--seed + i`, so runs are reproducible. Results go to `<ckpt_dir>/eval_aloha_{chunk,tagg}/`:
 `eval_results.json` plus `episode_XXX_{success,fail}.mp4`. Without EGL, set `MUJOCO_GL=osmesa`.
+
+### Evaluation (Franka Simulation, shared with Diffusion Policy)
+
+The sibling repo [`../robot-sim`](../robot-sim) provides a robosuite Franka Panda
+environment, robomimic demos converted to LeRobot v3 (84×84 agentview + wrist cameras,
+9-dim eef state, 10-dim absolute eef actions with 6D rotation, gripper 1 = open) and one
+seeded evaluation loop used by both this repo and the Diffusion Policy reimplementation.
+
+```bash
+# one-time: install robot-sim into this environment (opencv<5 matches the headless build here)
+uv pip install --python .venv/bin/python -e ../robot-sim "opencv-python<5"
+
+# train on the converted dataset (built in ../robot-sim, see its README)
+python train.py --dataset local/robomimic_lift_ph_abs_84 \
+    --data_root ../robot-sim/data/lerobot/lift_ph_abs_84 \
+    --chunk_size 20 --batch_size 32 --epochs 60 --crop_ratio 0.9 --ckpt_dir checkpoints/sim_lift
+
+# closed-loop evaluation, seeds 100000+ (same as the DP repo), chunked or temporal ensembling
+python eval.py --ckpt_dir checkpoints/sim_lift --env franka --task lift
+python eval.py --ckpt_dir checkpoints/sim_lift --env franka --task lift --temporal_agg
+```
+
+`--image_size` must match the dataset resolution (default 84). Results go to
+`<ckpt_dir>/eval_franka_<task>_{chunk,tagg}/` (`eval_results.json` + videos). robot-sim is
+not a declared dependency (CI has no `../robot-sim`); its tests skip when it is absent.
 
 ### Scripts
 
