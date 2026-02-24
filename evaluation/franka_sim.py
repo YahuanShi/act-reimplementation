@@ -25,7 +25,8 @@ class ACTSimPolicy:
         self.camera_names = list(camera_names)
         self.t = 0
 
-    def reset(self):
+    def reset(self, seed=None):
+        # ACT inference is deterministic (z = 0, dropout off), so seed is unused
         self.pipeline.reset()
         self.t = 0
 
