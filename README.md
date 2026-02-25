@@ -14,7 +14,7 @@ A from-scratch reimplementation of [Action Chunking with Transformers (ACT)](htt
 - [ ] **Demo** — Add demo GIF / video of real robot pick-and-place deployment
 - [ ] **Checkpoints** — Release trained checkpoints with download link
 - [ ] **Sim results** — Train on ALOHA TransferCube and report success rate (paper: ~90% scripted, ~50% human data)
-- [ ] **Franka sim results** — ACT vs Diffusion Policy on robomimic Lift / Can in the shared [`robot-sim`](../robot-sim) environment (same seeds)
+- [x] **Franka sim results** — ACT vs Diffusion Policy on robomimic Lift / Can in the shared [`robot-sim`](../robot-sim) environment (same seeds)
 - [ ] **Results** — Report open-loop error (`eval.py --dataset`) and real-robot success rate (`inference.py --num_episodes`)
 
 ---
@@ -490,6 +490,22 @@ python eval.py --ckpt_dir checkpoints/sim_lift --env franka --task lift --tempor
 `--image_size` must match the dataset resolution (default 84). Results go to
 `<ckpt_dir>/eval_franka_<task>_{chunk,tagg}/` (`eval_results.json` + videos). robot-sim is
 not a declared dependency (CI has no `../robot-sim`); its tests skip when it is absent.
+
+Results (50 episodes, seeds 100000–100049, 95% Wilson interval, `policy_best.ckpt`), same
+seeds as the Diffusion Policy reimplementation:
+
+| Policy | Training | Lift | Can |
+|---|---|---|---|
+| Diffusion Policy (U-Net) | 30k steps | **50/50 = 100%** (93–100%) | **48/50 = 96%** (87–99%) |
+| ACT, chunked execution | 60 epochs | 50/50 = 100% (93–100%) | 40/50 = 80% (67–89%) |
+| ACT, temporal ensembling | 60 epochs | 50/50 = 100% (93–100%) | 44/50 = 88% (76–94%) |
+
+Temporal ensembling improves Can from 80% to 88%; most of its failures are seeds that
+chunked execution also fails. Diffusion Policy is ahead on Can (clearly against chunked
+execution, within noise against temporal ensembling). ACT runs with the paper defaults
+(chunk 20, kl_weight 10), not tuned for robomimic — chunk size in particular is worth
+sweeping before drawing conclusions. Details in the
+[robot-sim README](../robot-sim#results-closed-loop-8484-images-absolute-actions).
 
 ### Scripts
 
