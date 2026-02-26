@@ -1,5 +1,5 @@
 """
-ACT ↔ robot_sim adapter (evaluation/franka_sim.py).
+ACT ↔ robot_sim adapter (evaluation/sim_policy.py).
 
 Skipped when robot_sim (sibling repo ../robot-sim) is not installed, e.g. in CI.
 """
@@ -10,7 +10,7 @@ import torch
 
 pytest.importorskip("robot_sim")
 
-from evaluation.franka_sim import ACTSimPolicy  # noqa: E402
+from evaluation.sim_policy import ACTSimPolicy  # noqa: E402
 
 CAMS = ["observation.images.agentview", "observation.images.wrist"]
 

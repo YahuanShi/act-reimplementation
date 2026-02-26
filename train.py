@@ -3,24 +3,26 @@ Training entry point for ACT.
 
 Usage:
   # Basic (ALOHA sim pick-and-place; ~45k steps)
-  python train.py --dataset lerobot/aloha_sim_transfer_cube_scripted \\
+  python train.py --repo_id lerobot/aloha_sim_transfer_cube_scripted \\
                   --chunk_size 100 --epochs 20 --batch_size 8
 
+  # Fixed step budget instead of epochs (comparable with the DP repo's --max_steps)
+  python train.py --repo_id local/my_data --root ./data/my_data --max_steps 30000
+
   # With wandb
-  python train.py --dataset lerobot/aloha_sim_transfer_cube_human \\
+  python train.py --repo_id lerobot/aloha_sim_transfer_cube_human \\
                   --wandb --wandb_project ACT --wandb_run_name aloha_run1
 
   # Resume from checkpoint
-  python train.py --dataset lerobot/aloha_sim_transfer_cube_human \\
-                  --resume checkpoints/checkpoint_full.pt
+  python train.py --repo_id lerobot/aloha_sim_transfer_cube_human \\
+                  --resume outputs/checkpoint_full.pt
 
-Output files (in --ckpt_dir):
-  policy_best.ckpt      best val loss, inference-ready (state_dict only)
-  policy_last.ckpt      final epoch state_dict
+Output files (in --output_dir):
+  policy_best.pt        best val loss, inference-ready (weights + config + normalizer)
+  policy_final.pt       end of training, same format
   checkpoint_full.pt    full state for --resume (policy + optimizer + epoch)
-  checkpoint_epochN.pt  periodic full checkpoints (keeps last --max_keep_ckpts)
-  dataset_stats.pkl     normalizer stats
-  config.json           all hyperparameters
+  checkpoint_epochN.pt  periodic full checkpoints (keeps last --max_keep_checkpoints)
+  config.json           all hyperparameters (human-readable copy)
   train_val_*.png       loss curves
 """
 
@@ -40,7 +42,7 @@ def split_by_episode(episode_indices, val_ratio, seed):
 
     Frames within one demonstration are near-duplicates of each other, so a
     frame-level random split puts almost-identical frames on both sides and
-    makes the validation loss (and thus policy_best.ckpt selection) overly
+    makes the validation loss (and thus policy_best.pt selection) overly
     optimistic. Holding out entire episodes measures generalisation to unseen
     demonstrations instead.
 
@@ -63,12 +65,12 @@ def split_by_episode(episode_indices, val_ratio, seed):
     return train_idx, val_idx, val_episodes
 
 
-def main(args):
+def train(args):
     # ── Dataset ──
-    print(f"Loading dataset: {args.dataset}")
+    print(f"Loading dataset: {args.repo_id}")
     dataset = LeRobotACTDataset(
-        repo_id=args.dataset,
-        root=args.data_root,
+        repo_id=args.repo_id,
+        root=args.root,
         chunk_size=args.chunk_size,
         episodes=args.episodes,
     )
@@ -80,7 +82,7 @@ def main(args):
     # ── Train/Val split (by episode) ──
     # Split whole episodes, not frames: neighbouring frames are nearly identical,
     # so a per-frame split puts near-copies of training samples into val and
-    # makes val loss (and the policy_best.ckpt choice) misleadingly optimistic.
+    # makes val loss (and the policy_best.pt choice) misleadingly optimistic.
     train_idx, val_idx, val_episodes = split_by_episode(
         dataset.episode_indices, args.val_ratio, args.seed
     )
@@ -92,7 +94,8 @@ def main(args):
     )
     print(f"  Samples:  {len(train_ds)} train / {len(val_ds)} val")
     steps_per_epoch = -(-len(train_ds) // args.batch_size)
-    print(f"  Steps:    {steps_per_epoch}/epoch, {steps_per_epoch * args.epochs} total")
+    total = args.max_steps or steps_per_epoch * args.epochs
+    print(f"  Steps:    {steps_per_epoch}/epoch, {total} total")
 
     # Image resolution and control rate the policy is trained on — saved to
     # config.json so inference.py can reproduce the exact preprocessing.
@@ -153,16 +156,19 @@ def main(args):
         "image_hw": [img_h, img_w],
         "fps": dataset.fps,
         "val_episodes": val_episodes,
+        "repo_id": args.repo_id,
+        "root": args.root,
         # Training
         "lr": args.lr,
         "num_epochs": args.epochs,
+        "max_steps": args.max_steps,
         "batch_size": args.batch_size,
-        "ckpt_dir": args.ckpt_dir,
+        "output_dir": args.output_dir,
         "seed": args.seed,
-        "save_every": args.save_every,
+        "save_every_epochs": args.save_every_epochs,
         "save_every_steps": args.save_every_steps,
         "grad_clip": args.grad_clip,
-        "max_keep_ckpts": args.max_keep_ckpts,
+        "max_keep_checkpoints": args.max_keep_checkpoints,
         "use_ema": args.use_ema,
         # Resume
         "resume": args.resume,
@@ -180,15 +186,15 @@ def main(args):
         best_epoch, best_loss, _ = best_info
         print("\nTraining complete.")
         print(f"  Best val loss: {best_loss:.6f} at epoch {best_epoch}")
-    print(f"  Checkpoints: {args.ckpt_dir}")
+    print(f"  Checkpoints: {args.output_dir}")
 
 
-if __name__ == "__main__":
+def main():
     parser = argparse.ArgumentParser(description="Train ACT policy")
 
     # Dataset
-    parser.add_argument("--dataset", type=str, required=True, help="LeRobot dataset repo_id")
-    parser.add_argument("--data_root", type=str, default=None, help="Local dataset root directory")
+    parser.add_argument("--repo_id", type=str, required=True, help="LeRobot dataset repo_id")
+    parser.add_argument("--root", type=str, default=None, help="Local root for LeRobot dataset")
     parser.add_argument(
         "--episodes",
         type=int,
@@ -219,6 +225,12 @@ if __name__ == "__main__":
     # per episode), so 2000 epochs from the paper would be ~400x more steps.
     # ALOHA sim (50 eps x 400 frames, bs=8): 1 epoch ≈ 2250 steps; 20 epochs ≈ 45k.
     parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument(
+        "--max_steps",
+        type=int,
+        default=None,
+        help="Train for exactly this many gradient steps instead of --epochs",
+    )
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--lr_backbone", type=float, default=1e-5)
@@ -244,9 +256,9 @@ if __name__ == "__main__":
     parser.add_argument("--no_ema", dest="use_ema", action="store_false", help="Disable EMA")
 
     # Checkpointing
-    parser.add_argument("--ckpt_dir", type=str, default="checkpoints")
+    parser.add_argument("--output_dir", type=str, default="outputs")
     parser.add_argument(
-        "--save_every", type=int, default=5, help="Save full checkpoint every N epochs"
+        "--save_every_epochs", type=int, default=5, help="Save full checkpoint every N epochs"
     )
     parser.add_argument(
         "--save_every_steps",
@@ -255,7 +267,7 @@ if __name__ == "__main__":
         help="Save step-level checkpoint every N steps for crash recovery (0 = disabled)",
     )
     parser.add_argument(
-        "--max_keep_ckpts",
+        "--max_keep_checkpoints",
         type=int,
         default=5,
         help="Max periodic checkpoints to keep (0 = keep all)",
@@ -269,4 +281,8 @@ if __name__ == "__main__":
     parser.add_argument("--wandb_project", type=str, default="ACT")
     parser.add_argument("--wandb_run_name", type=str, default=None)
 
-    main(parser.parse_args())
+    train(parser.parse_args())
+
+
+if __name__ == "__main__":
+    main()

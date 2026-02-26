@@ -11,7 +11,7 @@ import torch
 
 from act.dataset.normalizer import ACTNormalizer
 from act.policy.act_policy import ACTPolicy
-from inference.temporal_ensemble import InferencePipeline, TemporalEnsemble
+from act.policy.temporal_ensemble import InferencePipeline, TemporalEnsemble
 
 
 def test_temporal_ensemble_basic():

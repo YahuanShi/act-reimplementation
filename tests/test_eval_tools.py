@@ -2,16 +2,14 @@
 Tests for evaluation / deployment helpers that run without hardware.
 
 Validates:
-  - eval.open_loop_eval reports finite per-dim L1 and writes json + plots
+  - evaluation.offline.evaluate_offline reports finite per-dim L1 and writes plots
   - inference.resolve_camera_order follows config camera_names, fails on missing cams
   - inference._center_crop_resize produces the training resolution for any aspect ratio
 """
 
-import importlib.util
 import json
 import os
 import tempfile
-from pathlib import Path
 
 import numpy as np
 import pytest
@@ -20,17 +18,9 @@ from torch.utils.data import Dataset
 
 from act.dataset.normalizer import ACTNormalizer
 from act.policy.act_policy import ACTPolicy
-from eval import open_loop_eval
-from inference.temporal_ensemble import InferencePipeline
-
-# inference.py shares its name with the inference/ package, so load it by path
-_spec = importlib.util.spec_from_file_location(
-    "inference_script", Path(__file__).resolve().parents[1] / "inference.py"
-)
-inference_script = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(inference_script)
-_center_crop_resize = inference_script._center_crop_resize
-resolve_camera_order = inference_script.resolve_camera_order
+from act.policy.temporal_ensemble import InferencePipeline
+from evaluation.offline import evaluate_offline
+from inference import _center_crop_resize, resolve_camera_order
 
 CONFIG = {
     "state_dim": 7,
@@ -69,20 +59,21 @@ class _EpisodeDataset(Dataset):
         }
 
 
-def test_open_loop_eval_outputs():
+def test_evaluate_offline_outputs():
     normalizer = ACTNormalizer()
     normalizer.fit_from_tensors(torch.randn(50, 7), torch.randn(50, 7))
     pipeline = InferencePipeline(ACTPolicy(CONFIG), normalizer, chunk_size=10)
 
     with tempfile.TemporaryDirectory() as tmp:
-        m = open_loop_eval(pipeline, CONFIG, _EpisodeDataset(), [3, 5], tmp, batch_size=4)
+        m = evaluate_offline(
+            pipeline, CONFIG, _EpisodeDataset(), [3, 5], plot_dir=tmp, batch_size=4
+        )
         assert len(m["l1_first_step_per_dim"]) == 7
         assert len(m["l1_by_chunk_step"]) == 10
         assert np.isfinite(m["l1_chunk"])
         # padded chunk steps have no valid samples → reported as 0
         assert m["l1_by_chunk_step"][-1] == 0.0
-        with open(os.path.join(tmp, "open_loop_eval.json")) as f:
-            assert json.load(f)["n_frames"] == 10
+        assert json.loads(json.dumps(m))["n_frames"] == 10  # JSON-serialisable
         assert os.path.exists(os.path.join(tmp, "open_loop_ep3.png"))
         assert os.path.exists(os.path.join(tmp, "open_loop_ep5.png"))
 

@@ -4,18 +4,21 @@ A from-scratch reimplementation of [Action Chunking with Transformers (ACT)](htt
 
 ## Demo
 
-<!-- TODO: Add demo GIF / video of real robot pick-and-place deployment -->
+![ACT (temporal ensembling) in simulation](docs/sim_demo.gif)
+
+ACT (temporal ensembling) in the shared Franka simulation ([robot-sim](../robot-sim)): robomimic Lift and Can,
+closed loop from 84×84 camera images. Real-robot demo pending (no real-robot data yet).
+
 
 ---
 
 ## TODO
 
-- [ ] **Training** — Train on the UR5 pick-and-place dataset
-- [ ] **Demo** — Add demo GIF / video of real robot pick-and-place deployment
-- [ ] **Checkpoints** — Release trained checkpoints with download link
-- [ ] **Sim results** — Train on ALOHA TransferCube and report success rate (paper: ~90% scripted, ~50% human data)
+- [ ] **Training** — Train on the UR5 pick-and-place dataset (no real-robot data yet)
+- [ ] **Demo** — Add demo GIF / video of real robot pick-and-place deployment (simulation demo above)
+- [ ] **Sim results (ALOHA)** — Train on ALOHA TransferCube and report success rate (paper: ~90% scripted, ~50% human data)
 - [x] **Franka sim results** — ACT vs Diffusion Policy on robomimic Lift / Can in the shared [`robot-sim`](../robot-sim) environment (same seeds)
-- [ ] **Results** — Report open-loop error (`eval.py --dataset`) and real-robot success rate (`inference.py --num_episodes`)
+- [ ] **Real-robot success rate** — run N trials with `inference.py --num_episodes N --record_dir` and fill in [Results](#results) with `scripts/summarize_trials.py`
 
 ---
 
@@ -45,7 +48,7 @@ Both projects share the same robot hardware (UR5 + Weiss CRG gripper + dual Real
 |--|-----|-----------------|
 | **Action representation** | Deterministic transformer (z=0 at inference) | Iterative denoising (100 DDPM / 16 DDIM steps) |
 | **Multimodality** | CVAE latent at training time only | Full denoising trajectory at inference |
-| **Inference speed** | ~1 forward pass | ~100 forward passes (DDPM) |
+| **Inference speed** | ~1 forward pass | 16 forward passes (DDIM; 100 with DDPM) |
 | **Temporal context** | Single frame (no obs history) | Obs history window (To frames) |
 | **Smoothing** | Temporal ensembling | Action chunking (execute n steps) |
 | **Strength** | Fast, smooth via ensembling | Better multimodal coverage |
@@ -227,6 +230,8 @@ Input:
 
 ## 3. Project Architecture
 
+Same layout and CLI as the [Diffusion Policy reimplementation](../diffusion-policy-reimplementation).
+
 ```
 .
 ├── act/
@@ -237,32 +242,28 @@ Input:
 │   │   ├── position_encoding.py    # 1D sinusoidal + 2D sine position encodings
 │   │   ├── ema.py                  # Buffer-aware EMA (parameters + buffers)
 │   │   └── augmentation.py         # RandomCenterCrop + ColorJitter (train/eval auto-switch)
+│   ├── dataset/
+│   │   ├── lerobot_wrapper.py      # LeRobot v3 dataset adapter (image + state + action chunk)
+│   │   └── normalizer.py           # ACTNormalizer: fit from dataset, normalize qpos/action
 │   ├── policy/
-│   │   └── act_policy.py           # ACTPolicy: compute_loss, predict_action, optimizer
-│   └── dataset/
-│       ├── lerobot_wrapper.py      # LeRobot v3 dataset adapter (image + state + action)
-│       └── normalizer.py           # ACTNormalizer: fit from dataset, normalize qpos/action
+│   │   ├── act_policy.py           # ACTPolicy: compute_loss, predict_action, optimizer
+│   │   ├── temporal_ensemble.py    # InferencePipeline: chunked execution / temporal ensembling
+│   │   └── loader.py               # Load self-contained checkpoints (+ legacy checkpoint dirs)
+│   └── control.py                  # Real-robot helpers: precise_wait, gripper hysteresis, timing stats
 ├── training/
-│   └── workspace.py                # Training loop, EMA, checkpointing, wandb logging
-├── inference/
-│   └── temporal_ensemble.py        # InferencePipeline with temporal ensembling
+│   └── workspace.py                # Training loop, EMA, episode-level val, checkpoints, wandb
 ├── evaluation/
+│   ├── offline.py                  # Open-loop L1 vs recorded actions on held-out episodes
 │   ├── runner.py                   # Rollout runner (success via info['is_success']) + mock env
 │   ├── aloha_env.py                # gym-aloha (MuJoCo) adapter → ACT observation format
-│   └── franka_sim.py               # Adapter for the shared Franka simulation (../robot-sim)
-├── tests/
-│   ├── test_policy.py              # ACTPolicy loss and inference shape tests
-│   ├── test_normalizer.py          # Normalizer fit, normalize, denormalize
-│   ├── test_temporal_ensemble.py   # TemporalEnsemble correctness
-│   ├── test_ema.py                 # EMA decay schedule, step, copy_to, state_dict
-│   ├── test_split.py               # Episode-level train/val split
-│   ├── test_eval_tools.py          # Open-loop eval, camera order, image preprocessing
-│   ├── test_eval.py                # Rollout success logic, augmentation, ALOHA env adapter
-│   └── test_integration.py         # Train → checkpoint → resume → infer pipeline
+│   ├── sim_policy.py               # Adapter for the shared Franka simulation (../robot-sim)
+│   └── trial_recorder.py           # Save real-robot trials (videos, actions, outcome)
+├── tests/                          # pytest: policy, normalizer, ensembling, EMA, control, trials, integration
 ├── scripts/
 │   ├── hdf5_to_lerobot.py          # HDF5 robot episodes → LeRobot v3 format
 │   ├── visualize_dataset.py        # Plot action distributions and trajectories
-│   └── benchmark_inference.py      # Measure inference latency (chunk_size, cameras)
+│   ├── benchmark_inference.py      # Measure inference latency (chunk_size, cameras)
+│   └── summarize_trials.py         # Success rate (with 95% CI) + demo GIF from recorded trials
 ├── experiments/                    # Step-by-step validation scripts (run in order)
 │   ├── 01_transformer_test.py      # Transformer encoder/decoder shapes and gradients
 │   ├── 02_backbone_test.py         # ResNet18 backbone feature extraction
@@ -274,10 +275,10 @@ Input:
 │   ├── 08_inference_test.py        # InferencePipeline and temporal ensembling
 │   └── 09_integration_test.py      # Full pipeline: dataset → train → checkpoint → infer
 ├── train.py                        # Training entry point
-├── eval.py                         # Sim rollouts (ALOHA / mock) or open-loop eval on held-out episodes
-├── inference.py                    # Real robot inference + success-rate evaluation
+├── eval.py                         # Evaluation entry point (offline / sim / mock)
+├── inference.py                    # Real robot inference (UR + Weiss gripper + RealSense)
 ├── setup.sh                        # One-click environment setup (uv)
-└── pyproject.toml                  # Dependencies and project metadata
+└── pyproject.toml                  # Dependencies, ruff config, project metadata
 ```
 
 ---
@@ -294,8 +295,8 @@ uv venv && uv sync --extra dev
 # (Optional) ALOHA MuJoCo simulation for evaluation (gym-aloha)
 uv sync --extra dev --extra sim
 
-# (Optional) robot hardware dependencies
-uv sync --extra robot
+# (Optional) robot hardware dependencies (ur-rtde, RealSense, serial, OpenCV)
+uv sync --extra dev --extra robot
 
 # Install pre-commit hooks
 pre-commit install
@@ -313,46 +314,44 @@ Requires Python 3.10+ and a CUDA-capable GPU for training.
 > the original ACT samples one frame per episode per epoch. For ALOHA sim
 > (50 episodes × 400 frames, batch 8) one epoch ≈ 2250 steps, so `--epochs 20`
 > (≈ 45k steps) is in the range of the paper's training budget, while the paper's
-> `2000` would be ~400× longer.
+> `2000` would be ~400× longer. `--max_steps` sets an exact step budget instead.
 
 ```bash
 # ALOHA sim pick-and-place (scripted demos — start here)
 python train.py \
-    --dataset lerobot/aloha_sim_transfer_cube_scripted \
+    --repo_id lerobot/aloha_sim_transfer_cube_scripted \
     --chunk_size 100 --epochs 20 --batch_size 8 \
-    --ckpt_dir checkpoints/transfer_cube_scripted
+    --output_dir outputs/transfer_cube_scripted
 
-# Local dataset (--data_root must point to the dataset directory, not its parent)
+# Local dataset (--root must point to the dataset directory, not its parent)
 python train.py \
-    --dataset local/ur5_pick_place --data_root ./data/ur5_pick_place \
-    --chunk_size 50 --epochs 30 --batch_size 16
+    --repo_id local/ur5_pick_place --root ./data/ur5_pick_place \
+    --chunk_size 50 --max_steps 30000 --batch_size 16 --output_dir outputs/ur5
 
 # With augmentation (random crop to 95% of H/W + color jitter; center crop at eval)
-python train.py \
-    --dataset lerobot/aloha_sim_transfer_cube_human \
+python train.py --repo_id lerobot/aloha_sim_transfer_cube_human \
     --crop_ratio 0.95 --color_jitter
 
 # With wandb logging
-python train.py \
-    --dataset lerobot/aloha_sim_transfer_cube_human \
+python train.py --repo_id lerobot/aloha_sim_transfer_cube_human \
     --wandb --wandb_project ACT --wandb_run_name run1
 
 # Step-level checkpointing for crash recovery (saves every 500 steps, keeps last 3)
-python train.py \
-    --dataset lerobot/aloha_sim_transfer_cube_human \
-    --save_every_steps 500 --max_keep_ckpts 3
+python train.py --repo_id lerobot/aloha_sim_transfer_cube_human \
+    --save_every_steps 500 --max_keep_checkpoints 3
 ```
 
 Key arguments:
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `--dataset` | required | LeRobot dataset repo_id |
-| `--data_root` | None | Local dataset root directory |
+| `--repo_id` | required | LeRobot dataset repo_id |
+| `--root` | None | Local dataset root directory |
 | `--episodes` | all | Only use these episode indices (quick debug runs) |
 | `--val_ratio` | 0.1 | Fraction of **episodes** held out for validation |
 | `--chunk_size` | 100 | Action chunk length (`num_queries`) |
 | `--epochs` | 20 | Passes over all frames (see note above) |
+| `--max_steps` | None | Exact number of gradient steps (overrides `--epochs`) |
 | `--batch_size` | 8 | Batch size |
 | `--lr` | 1e-5 | Learning rate |
 | `--kl_weight` | 10.0 | CVAE KL divergence weight (β) |
@@ -361,137 +360,87 @@ Key arguments:
 | `--lr_backbone` | 1e-5 | Backbone learning rate (0 = frozen backbone) |
 | `--crop_ratio` | 1.0 | Random crop to this fraction of H/W in training, center crop at eval (1.0 = off) |
 | `--color_jitter` | False | Color jitter during training |
-| `--save_every` | 5 | Save epoch checkpoint every N epochs |
-| `--save_every_steps` | 0 | Save step checkpoint every N steps (0 = off) |
+| `--output_dir` | outputs | Where checkpoints, config and plots are written |
+| `--save_every_epochs` | 5 | Save a full checkpoint every N epochs |
+| `--save_every_steps` | 0 | Save a step checkpoint every N steps (0 = off) |
+| `--max_keep_checkpoints` | 5 | Periodic checkpoints to keep (0 = all) |
 | `--no_ema` | — | Disable EMA (EMA is on by default) |
 | `--wandb` | False | Enable wandb logging |
 | `--resume` | None | Path to `checkpoint_full.pt` / `checkpoint_epochN.pt` / `checkpoint_stepN.pt` |
 
-Output files (saved to `--ckpt_dir`, default `checkpoints/`):
+Output files (in `--output_dir`):
 
-- `policy_best.ckpt` — EMA weights at lowest val loss (val loss is computed with the EMA weights), inference-ready
-- `policy_last.ckpt` — EMA weights at final epoch
-- `checkpoint_full.pt` — latest full state for `--resume` (policy + EMA + optimizer + epoch), updated every `--save_every` epochs and at the end
-- `checkpoint_epochN.pt` — periodic full checkpoints (keeps last `--max_keep_ckpts`)
-- `checkpoint_stepN.pt` — step-level checkpoints for crash recovery; resuming from one re-runs the interrupted epoch
-- `dataset_stats.pkl` — normalizer statistics
-- `config.json` — all hyperparameters plus data properties used at deployment (`image_hw`, `fps`, `camera_names`, `val_episodes`)
+- `policy_best.pt` — EMA weights at lowest val loss (computed with the EMA weights) — for deployment
+- `policy_final.pt` — EMA weights at the end of training
+- `checkpoint_full.pt` — latest full state for `--resume` (policy + EMA + optimizer + epoch), updated every `--save_every_epochs` epochs and at the end
+- `checkpoint_epochN.pt` / `checkpoint_stepN.pt` — periodic full checkpoints; resuming from a step checkpoint re-runs the interrupted epoch
+- `config.json` — all hyperparameters plus data properties used at deployment (`image_hw`, `fps`, `camera_names`, `val_episodes`, `repo_id`)
 - `train_val_*.png` — loss curves (loss, l1, kl)
+
+`policy_best.pt` and `policy_final.pt` are **self-contained** (weights + config + normalizer
+stats), so `eval.py` / `inference.py` need only that one file. Checkpoint directories from
+before this format (`policy_best.ckpt` + `config.json` + `dataset_stats.pkl`) still load.
 
 ### Resume Training
 
 ```bash
 python train.py \
-    --dataset lerobot/aloha_sim_transfer_cube_human \
-    --resume checkpoints/checkpoint_full.pt \
+    --repo_id lerobot/aloha_sim_transfer_cube_human \
+    --resume outputs/checkpoint_full.pt \
     --epochs 30
 ```
 
-### Real Robot Inference (UR + Weiss CRG + RealSense)
+### Evaluation
 
-Hardware: UR robot arm, Weiss CRG 30-050 gripper, Intel RealSense cameras.
+`--checkpoint` takes a `policy_*.pt` file or a training output directory (→ `policy_best.pt`).
+Chunked execution is the default; `--temporal_agg` switches to temporal ensembling.
 
-```bash
-# Install robot dependencies
-uv sync --extra robot
-
-# Dry run — full pipeline, but the robot is never moved (no homing, no servo commands)
-python inference.py \
-    --ckpt_dir checkpoints \
-    --robot_ip 192.168.1.10 --dry_run
-
-# Real deployment with temporal ensembling (smoother motion)
-python inference.py \
-    --ckpt_dir checkpoints \
-    --robot_ip 192.168.1.10 \
-    --cam_exterior <serial> --cam_wrist <serial> \
-    --temporal_agg
-
-# Custom episode length, headless (no cv2 window)
-python inference.py \
-    --ckpt_dir checkpoints \
-    --robot_ip 192.168.1.10 \
-    --max_steps 500 --no_vis
-```
-
-`inference.py` reads `config.json` from the checkpoint directory and keeps deployment
-consistent with training:
-
-- **Image resolution** — frames are center-cropped to the training aspect ratio and resized to `image_hw`
-- **Control frequency** — defaults to the dataset `fps`; a different `--frequency` logs a warning (motions would play back faster / slower)
-- **Camera order** — follows `camera_names` (matched by the last key segment, e.g. `observation.images.wrist` → `wrist`); a missing camera is an error
-- **State range** — before each episode, the robot's qpos is compared with the training statistics and dimensions more than 5σ away are reported (catches deg/rad or gripper-convention mismatches)
-
-### Evaluation (Open-Loop and Real Robot)
-
-**Open-loop** (no robot): replay the held-out validation episodes (`val_episodes` in `config.json`),
-predict a chunk at every frame and compare with the demonstrated actions in raw units.
-Writes `open_loop_eval.json` (per-joint L1, L1 along the chunk) and one trajectory plot per episode.
+Offline (default): replays the held-out validation episodes stored in the checkpoint,
+predicts a chunk at every frame and compares it with the demonstrated actions in raw units
+(per-dim L1 at the first step and over the chunk, L1 along the chunk).
 
 ```bash
-python eval.py --ckpt_dir checkpoints \
-    --dataset local/ur5_pick_place --data_root ./data/ur5_pick_place
+python eval.py --checkpoint outputs/ur5/policy_best.pt
+python eval.py --checkpoint outputs/ur5/policy_best.pt --episodes 3 17 42 \
+    --plot_dir outputs/ur5/plots --output_json outputs/ur5/offline.json
 ```
 
-**Closed-loop on the real robot**: run N rollouts; before each one the operator resets the scene,
-after each one they label it success / failure. Videos and an `eval_<timestamp>.json` summary
-(success rate, per-episode results) are written.
+Open-loop error says nothing about compounding errors and multimodal demos make "wrong"
+predictions valid, so use it to compare checkpoints and catch broken normalization —
+not as a success rate.
 
+Simulation (closed loop, success rate): see [Simulation (Franka Panda)](#simulation-franka-panda)
+and [Simulation (ALOHA)](#simulation-aloha).
+
+Mock rollout (pipeline smoke test only):
 ```bash
-python inference.py --ckpt_dir checkpoints --robot_ip 192.168.1.10 \
-    --temporal_agg --num_episodes 20 --record_dir eval_videos
+python eval.py --checkpoint outputs/ur5/policy_best.pt --mock --n_episodes 2
 ```
 
-### Evaluation (ALOHA Simulation)
+### Simulation (Franka Panda)
 
-Rolls out the policy in gym-aloha (MuJoCo, rendered headless via EGL) and reports
-the success rate. Requires `uv sync --extra sim`.
-
-```bash
-# 50 episodes of TransferCube, chunked execution, 5 videos saved
-python eval.py --ckpt_dir checkpoints/transfer_cube_scripted --env aloha
-
-# Same with temporal ensembling
-python eval.py --ckpt_dir checkpoints/transfer_cube_scripted --env aloha --temporal_agg
-
-# Insertion task (train on lerobot/aloha_sim_insertion_scripted first)
-python eval.py --ckpt_dir checkpoints/insertion --env aloha --task AlohaInsertion-v0
-
-# Pipeline check without a simulator (random observations)
-python eval.py --ckpt_dir checkpoints --env mock --n_episodes 2
-```
-
-An episode is a success when the env reports `info["is_success"]` (TransferCube:
-reward 4 — cube held by the left gripper, off the table). Episode `i` resets with
-`--seed + i`, so runs are reproducible. Results go to `<ckpt_dir>/eval_aloha_{chunk,tagg}/`:
-`eval_results.json` plus `episode_XXX_{success,fail}.mp4`. Without EGL, set `MUJOCO_GL=osmesa`.
-
-### Evaluation (Franka Simulation, shared with Diffusion Policy)
-
-The sibling repo [`../robot-sim`](../robot-sim) provides a robosuite Franka Panda
-environment, robomimic demos converted to LeRobot v3 (84×84 agentview + wrist cameras,
-9-dim eef state, 10-dim absolute eef actions with 6D rotation, gripper 1 = open) and one
-seeded evaluation loop used by both this repo and the Diffusion Policy reimplementation.
+While the real robot is unavailable, policies are trained and evaluated in the shared
+simulation repo [`../robot-sim`](../robot-sim) (robosuite Franka Panda + robomimic demos,
+converted to LeRobot v3: 84×84 agentview + wrist cameras, 9-dim eef state, 10-dim absolute
+eef actions with 6D rotation, gripper 1 = open). The Diffusion Policy reimplementation uses
+the same environment and seeds, so success rates are directly comparable.
 
 ```bash
 # one-time: install robot-sim into this environment (opencv<5 matches the headless build here)
 uv pip install --python .venv/bin/python -e ../robot-sim "opencv-python<5"
 
 # train on the converted dataset (built in ../robot-sim, see its README)
-python train.py --dataset local/robomimic_lift_ph_abs_84 \
-    --data_root ../robot-sim/data/lerobot/lift_ph_abs_84 \
-    --chunk_size 20 --batch_size 32 --epochs 60 --crop_ratio 0.9 --ckpt_dir checkpoints/sim_lift
+python train.py --repo_id local/robomimic_lift_ph_abs_84 \
+    --root ../robot-sim/data/lerobot/lift_ph_abs_84 \
+    --chunk_size 20 --batch_size 32 --epochs 60 --crop_ratio 0.9 --output_dir outputs/sim_lift
 
-# closed-loop evaluation, seeds 100000+ (same as the DP repo), chunked or temporal ensembling
-python eval.py --ckpt_dir checkpoints/sim_lift --env franka --task lift
-python eval.py --ckpt_dir checkpoints/sim_lift --env franka --task lift --temporal_agg
+# closed-loop evaluation: 50 seeded episodes (seeds 100000+), videos of the first 5
+python eval.py --checkpoint outputs/sim_lift --sim lift --n_episodes 50 \
+    --video_dir outputs/sim_lift/videos --output_json outputs/sim_lift/eval_chunk.json
+python eval.py --checkpoint outputs/sim_lift --sim lift --n_episodes 50 --temporal_agg
 ```
 
-`--image_size` must match the dataset resolution (default 84). Results go to
-`<ckpt_dir>/eval_franka_<task>_{chunk,tagg}/` (`eval_results.json` + videos). robot-sim is
-not a declared dependency (CI has no `../robot-sim`); its tests skip when it is absent.
-
-Results (50 episodes, seeds 100000–100049, 95% Wilson interval, `policy_best.ckpt`), same
+Results (50 episodes, seeds 100000–100049, 95% Wilson interval, `policy_best`), same
 seeds as the Diffusion Policy reimplementation:
 
 | Policy | Training | Lift | Can |
@@ -503,17 +452,89 @@ seeds as the Diffusion Policy reimplementation:
 Temporal ensembling improves Can from 80% to 88%; most of its failures are seeds that
 chunked execution also fails. Diffusion Policy is ahead on Can (clearly against chunked
 execution, within noise against temporal ensembling). ACT runs with the paper defaults
-(chunk 20, kl_weight 10), not tuned for robomimic — chunk size in particular is worth
-sweeping before drawing conclusions. Details in the
+(chunk 20, kl_weight 10), not tuned for robomimic. Details in the
 [robot-sim README](../robot-sim#results-closed-loop-8484-images-absolute-actions).
+
+`robot-sim` is not a declared dependency (CI has no `../robot-sim` checkout): the sim
+tests skip when it is not installed, and a later `uv sync` removes it again.
+
+### Simulation (ALOHA)
+
+Rolls out the policy in gym-aloha (MuJoCo, bimanual ViperX, rendered headless via EGL).
+Requires `uv sync --extra sim`.
+
+```bash
+python eval.py --checkpoint outputs/transfer_cube_scripted --sim aloha_transfer_cube
+python eval.py --checkpoint outputs/transfer_cube_scripted --sim aloha_transfer_cube --temporal_agg
+python eval.py --checkpoint outputs/insertion --sim aloha_insertion   # train on *_insertion_* first
+```
+
+An episode is a success when the env reports `info["is_success"]` (TransferCube:
+reward 4 — cube held by the left gripper, off the table). Episode `i` resets with
+`--start_seed + i` (default 1000). Without EGL, set `MUJOCO_GL=osmesa`.
+
+### Real Robot Inference (UR + Weiss CRG + RealSense)
+
+Hardware: UR robot arm, Weiss CRG 30-050 gripper, Intel RealSense cameras.
+
+```bash
+# Install robot dependencies
+uv sync --extra dev --extra robot
+
+# Dry run — full pipeline, but the robot is never moved (no homing, no servo commands)
+python inference.py --checkpoint outputs/ur5/policy_best.pt \
+    --robot_ip 192.168.1.10 --dry_run
+
+# Real deployment with temporal ensembling (control rate defaults to the dataset fps)
+python inference.py --checkpoint outputs/ur5/policy_best.pt \
+    --robot_ip 192.168.1.10 --temporal_agg
+```
+
+- `--frequency` — control rate in Hz; defaults to the dataset fps stored in the checkpoint and refuses a mismatch unless `--allow_fps_mismatch` is given
+- `--temporal_agg`, `--k` — temporal ensembling and its decay constant (default: chunked execution)
+- `--max_steps` — control steps per episode (default: 800 = 40 s at 20 Hz; the longest demo is ~33 s)
+- `--max_joint_vel` — per-joint velocity clamp in rad/s (default: 1.0)
+- `--num_episodes`, `--record_dir` — several rollouts in one session, each recorded (see below)
+- `--no_gripper`, `--cam_exterior`, `--cam_wrist` (`''` disables a camera), `--image_size`, `--no_vis`
+
+Consistency with training, all read from the checkpoint:
+
+- **Units and gripper convention** — the training data stores joint angles in **degrees** and the gripper as **1 = open, 0 = closed** (every demonstration starts and ends open). `getActualQ()` radians are converted to degrees for the state and actions are converted back before `servoJ`. Before each episode the robot state is compared with the training statistics; dimensions more than 5σ away are reported (catches deg/rad or gripper-convention mismatches in a new dataset)
+- **Image resolution** — frames are center-cropped to the training aspect ratio and resized to `image_hw`
+- **Camera order** — follows `camera_names` (matched by the last key segment, e.g. `observation.images.wrist` → `wrist`); a missing camera is an error
+
+Sensors are read by background threads (one per camera, one for the gripper's serial
+stream), so `get_obs()` only copies the latest cached readings and never blocks the
+control loop; it refuses data older than 0.5 s. Each step runs at an absolute time slot;
+the episode ends with the effective control rate and a timing summary (`obs`, `infer`,
+`late`, `age`). **Check these in a `--dry_run` before the first real run.** The continuous
+gripper channel goes through hysteresis + a 1 s dwell time before it switches the gripper.
+
+### Recording Trials (Demo & Success Rate)
+
+```bash
+# 20 rollouts; each is saved to trials/trial_<timestamp>/ (exterior.mp4, wrist.mp4,
+# steps.npz, meta.json) and the operator labels it success / failure afterwards
+python inference.py --checkpoint outputs/ur5/policy_best.pt --robot_ip 192.168.1.10 \
+    --temporal_agg --num_episodes 20 --record_dir trials/
+
+# Success rate per checkpoint with a 95% Wilson interval (dry runs and unanswered trials are skipped)
+python scripts/summarize_trials.py --record_dir trials/ --markdown trials/results.md
+
+# Side-by-side camera demo GIF from one trial
+python scripts/summarize_trials.py --gif trials/trial_20261020_101500 --out demo.gif
+```
+
+### Data Conversion (HDF5 → LeRobot)
+
+```bash
+python scripts/hdf5_to_lerobot.py \
+    --input /path/to/episodes --repo_id local/my_dataset --root ./data/my_dataset
+```
 
 ### Scripts
 
 ```bash
-# Convert HDF5 robot episodes to LeRobot v3 format
-python scripts/hdf5_to_lerobot.py \
-    --input /path/to/episodes --repo_id local/my_dataset --root ./data/my_dataset
-
 # Visualize action distributions and episode lengths (sanity check before training)
 python scripts/visualize_dataset.py --repo_id lerobot/aloha_sim_transfer_cube_human
 
@@ -527,7 +548,24 @@ python scripts/benchmark_inference.py --device cuda --num_cam 2
 pytest tests/ -v
 ```
 
-53 tests covering normalizer, policy (incl. augmentation and backbone freezing), temporal ensembling, EMA, train/val split, evaluation rollouts and tools, and end-to-end training / resume.
+Tests cover the normalizer, policy (incl. augmentation and backbone freezing), temporal
+ensembling, EMA, train/val split, control helpers, trial recording, evaluation rollouts and
+tools, the Franka sim adapter (skipped without robot-sim) and end-to-end training / resume /
+checkpoint loading. They run in CI (`.github/workflows/ci.yml`) together with `ruff check`.
+
+---
+
+## Results
+
+<!-- Fill in from `python scripts/summarize_trials.py --record_dir trials/ --markdown trials/results.md` -->
+
+Real robot:
+
+| Checkpoint | Success | Rate | 95% CI | Mean duration |
+|---|---|---|---|---|
+| — | — | — | — | — |
+
+Simulation: see [Simulation (Franka Panda)](#simulation-franka-panda).
 
 ---
 

@@ -237,7 +237,7 @@ class DETRVAE(nn.Module):
             # Extract visual features from all cameras
             all_cam_features = []
             all_cam_pos = []
-            for cam_id, cam_name in enumerate(self.camera_names):
+            for cam_id in range(len(self.camera_names)):
                 # All cameras share the same backbone (backbones[0])
                 features, pos = self.backbones[0](image[:, cam_id])
                 features = features[0]  # take last layer features

@@ -24,7 +24,7 @@ import torch
 
 from act.dataset.normalizer import ACTNormalizer
 from act.policy.act_policy import ACTPolicy
-from inference.temporal_ensemble import InferencePipeline
+from act.policy.temporal_ensemble import InferencePipeline
 
 
 def build_policy(state_dim, action_dim, chunk_size, num_cam, device):

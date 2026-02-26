@@ -15,8 +15,8 @@ import torch
 
 from act.dataset.normalizer import ACTNormalizer
 from act.policy.act_policy import ACTPolicy
+from act.policy.temporal_ensemble import InferencePipeline
 from evaluation.runner import EvalRunner, MockEnv, run_episode
-from inference.temporal_ensemble import InferencePipeline
 
 
 def make_config(**overrides):
@@ -81,9 +81,9 @@ def test_runner_success_rate_and_videos():
         policy=policy,
         normalizer=normalizer,
         chunk_size=10,
-        n_test=2,
+        n_episodes=2,
         max_steps=4,
-        num_videos=1,
+        n_videos=1,
     )
     metrics = runner.run()
     assert metrics["success_rate"] == 1.0

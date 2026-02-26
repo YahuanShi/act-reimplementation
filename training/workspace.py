@@ -8,17 +8,21 @@ Training loop structure (validate-first, then train each epoch):
     2. Training pass    → gradient update per batch + EMA step
     3. Log metrics, save checkpoints
 
-Checkpointing strategy:
-  - policy_best.ckpt    : EMA weights at lowest val loss — use for inference
-  - policy_last.ckpt    : EMA weights at final epoch
+Checkpointing strategy (in output_dir):
+  - policy_best.pt      : EMA weights at lowest val loss — use for inference
+  - policy_final.pt     : EMA weights at the end of training
+                          (both self-contained: weights + config + normalizer stats,
+                           see act/policy/loader.py)
   - checkpoint_full.pt  : latest full state (policy + EMA + optimizer + epoch/step),
-                           overwritten every save_every epochs and at the end — use for --resume
-  - checkpoint_epochN.pt: periodic copies of the full state (keeps last max_keep_ckpts)
+                           overwritten every save_every_epochs and at the end — use for --resume
+  - checkpoint_epochN.pt: periodic copies of the full state (keeps last max_keep_checkpoints)
   - checkpoint_stepN.pt : step-level full state every save_every_steps steps
-                           (keeps last max_keep_ckpts), also valid for --resume:
+                           (keeps last max_keep_checkpoints), also valid for --resume:
                            the interrupted epoch is re-run from its start
-  - dataset_stats.pkl   : normalizer stats for inference
-  - config.json         : all hyperparameters for reproducibility
+  - config.json         : all hyperparameters, human-readable copy
+
+Training length: num_epochs, or max_steps gradient steps if given (the last epoch is
+cut short) — max_steps makes budgets comparable with the step-based DP repo.
 
 Optional wandb logging:
   Set use_wandb=True in config and optionally wandb_project / wandb_run_name.
@@ -30,7 +34,6 @@ import glob
 import json
 import math
 import os
-import pickle
 import warnings
 from copy import deepcopy
 
@@ -55,11 +58,11 @@ class TrainWorkspace:
             Model keys: state_dim, action_dim, hidden_dim, dim_feedforward,
                 backbone, lr_backbone, enc_layers, dec_layers, nheads,
                 num_queries, camera_names, lr, kl_weight
-            Training keys: num_epochs, batch_size, ckpt_dir, seed,
-                save_every (default 5), grad_clip (default 1.0),
+            Training keys: num_epochs, max_steps (optional), batch_size, output_dir,
+                seed, save_every_epochs (default 5), grad_clip (default 1.0),
                 use_wandb (default False), wandb_project (default "ACT"),
                 wandb_run_name (default None), resume (default None),
-                max_keep_ckpts (default 5)
+                max_keep_checkpoints (default 5)
     """
 
     def __init__(self, config):
@@ -70,8 +73,8 @@ class TrainWorkspace:
         torch.manual_seed(seed)
         np.random.seed(seed)
 
-        self.ckpt_dir = config["ckpt_dir"]
-        os.makedirs(self.ckpt_dir, exist_ok=True)
+        self.output_dir = config["output_dir"]
+        os.makedirs(self.output_dir, exist_ok=True)
 
     def run(self, train_dataloader, val_dataloader, normalizer=None):
         """
@@ -82,15 +85,18 @@ class TrainWorkspace:
         """
         config = self.config
         num_epochs = config["num_epochs"]
-        save_every = config.get("save_every", 5)
+        max_steps = config.get("max_steps")
+        if max_steps:
+            num_epochs = math.ceil(max_steps / len(train_dataloader))
+        save_every = config.get("save_every_epochs", 5)
         save_every_steps = config.get("save_every_steps", 0)
         grad_clip = config.get("grad_clip", 1.0)
         use_wandb = config.get("use_wandb", False)
-        max_keep_ckpts = config.get("max_keep_ckpts", 5)
+        max_keep_ckpts = config.get("max_keep_checkpoints", 5)
         use_ema = config.get("use_ema", True)
 
         # ── Save config ──
-        cfg_path = os.path.join(self.ckpt_dir, "config.json")
+        cfg_path = os.path.join(self.output_dir, "config.json")
         with open(cfg_path, "w") as f:
             json.dump({k: v for k, v in config.items() if _json_serializable(v)}, f, indent=2)
 
@@ -99,18 +105,14 @@ class TrainWorkspace:
         policy.to(self.device)
         optimizer = policy.configure_optimizers()
 
-        total_steps = len(train_dataloader) * num_epochs
+        total_steps = max_steps or len(train_dataloader) * num_epochs
         lr_scheduler = _cosine_schedule(optimizer, total_steps, min_lr_ratio=0.1)
 
         # ── EMA ──
         ema = EMAModel(policy) if use_ema else None
 
-        # ── Save normalizer ──
-        self.normalizer = normalizer  # used in _train_epoch and _validate
-        if normalizer is not None:
-            stats_path = os.path.join(self.ckpt_dir, "dataset_stats.pkl")
-            with open(stats_path, "wb") as f:
-                pickle.dump(normalizer.state_dict(), f)
+        # Normalizer: used in _train_epoch / _validate, stored in every inference checkpoint
+        self.normalizer = normalizer
 
         # ── Resume ──
         start_epoch = 0
@@ -161,7 +163,7 @@ class TrainWorkspace:
 
         for epoch in tqdm(range(start_epoch, num_epochs), desc="Training"):
             # ── Validation ──
-            # Evaluate the EMA weights: they are what policy_best.ckpt stores
+            # Evaluate the EMA weights: they are what policy_best.pt stores
             # and what gets deployed, so model selection must be based on them.
             eval_policy = ema.averaged_model if ema is not None else policy
             val_summary = self._validate(eval_policy, val_dataloader)
@@ -175,8 +177,7 @@ class TrainWorkspace:
                     ema.averaged_model.state_dict() if ema is not None else policy.state_dict()
                 )
                 best_ckpt_info = (epoch, min_val_loss, deepcopy(best_weights))
-                best_path = os.path.join(self.ckpt_dir, "policy_best.ckpt")
-                torch.save(best_ckpt_info[2], best_path)
+                self._save_inference(best_ckpt_info[2], "policy_best.pt")
 
             # ── Training ──
             epoch_train_losses, global_step = self._train_epoch(
@@ -192,6 +193,7 @@ class TrainWorkspace:
                 max_keep_ckpts,
                 epoch,
                 min_val_loss,
+                max_steps,
             )
             train_history.extend(epoch_train_losses)
             epoch_train_summary = _compute_dict_mean(epoch_train_losses)
@@ -233,9 +235,9 @@ class TrainWorkspace:
                     policy, optimizer, ema, epoch, global_step, min_val_loss, epoch_complete=True
                 )
                 # checkpoint_full.pt always holds the latest resumable state
-                torch.save(ckpt_data, os.path.join(self.ckpt_dir, "checkpoint_full.pt"))
-                torch.save(ckpt_data, os.path.join(self.ckpt_dir, f"checkpoint_epoch{epoch}.pt"))
-                _prune_ckpts(self.ckpt_dir, "checkpoint_epoch*.pt", max_keep_ckpts)
+                torch.save(ckpt_data, os.path.join(self.output_dir, "checkpoint_full.pt"))
+                torch.save(ckpt_data, os.path.join(self.output_dir, f"checkpoint_epoch{epoch}.pt"))
+                _prune_ckpts(self.output_dir, "checkpoint_epoch*.pt", max_keep_ckpts)
                 self._plot_history(train_history, validation_history, epoch, num_epochs)
 
         # ── Final saves ──
@@ -245,14 +247,12 @@ class TrainWorkspace:
         full_ckpt = _full_state(
             policy, optimizer, ema, last_epoch, global_step, min_val_loss, epoch_complete=True
         )
-        torch.save(full_ckpt, os.path.join(self.ckpt_dir, "checkpoint_full.pt"))
+        torch.save(full_ckpt, os.path.join(self.output_dir, "checkpoint_full.pt"))
 
-        # Copy EMA weights into policy before saving the last inference checkpoint
+        # Copy EMA weights into policy before saving the final inference checkpoint
         if ema is not None:
             ema.copy_to(policy)
-
-        last_path = os.path.join(self.ckpt_dir, "policy_last.ckpt")
-        torch.save(policy.state_dict(), last_path)
+        self._save_inference(policy.state_dict(), "policy_final.pt")
 
         if best_ckpt_info is not None:
             best_epoch, best_loss, _ = best_ckpt_info
@@ -265,11 +265,22 @@ class TrainWorkspace:
             import wandb
 
             artifact = wandb.Artifact("act-policy", type="model")
-            artifact.add_file(os.path.join(self.ckpt_dir, "policy_best.ckpt"))
+            artifact.add_file(os.path.join(self.output_dir, "policy_best.pt"))
             wandb.log_artifact(artifact)
             wandb.finish()
 
         return best_ckpt_info
+
+    def _save_inference(self, state_dict, name):
+        """Self-contained inference checkpoint: weights + config + normalizer stats."""
+        payload = {
+            "policy_state_dict": state_dict,
+            "config": {k: v for k, v in self.config.items() if _json_serializable(v)},
+            "normalizer_state_dict": (
+                self.normalizer.state_dict() if self.normalizer is not None else None
+            ),
+        }
+        torch.save(payload, os.path.join(self.output_dir, name))
 
     def _train_epoch(
         self,
@@ -285,12 +296,15 @@ class TrainWorkspace:
         max_keep_ckpts=5,
         epoch=0,
         best_val_loss=float("inf"),
+        max_steps=None,
     ):
-        """One training epoch; returns (loss_dicts, updated_global_step)."""
+        """One training epoch (cut short at max_steps); returns (loss_dicts, global_step)."""
         policy.train()
         epoch_losses = []
 
         for batch in dataloader:
+            if max_steps and global_step >= max_steps:
+                break
             qpos = batch["qpos"].to(self.device)
             image = batch["image"].to(self.device)
             actions = batch["action"].to(self.device)
@@ -333,13 +347,13 @@ class TrainWorkspace:
 
             # ── Step-level checkpoint (crash recovery) ──
             if save_every_steps > 0 and global_step % save_every_steps == 0:
-                step_path = os.path.join(self.ckpt_dir, f"checkpoint_step{global_step}.pt")
+                step_path = os.path.join(self.output_dir, f"checkpoint_step{global_step}.pt")
                 # Written mid-epoch: epoch_complete=False makes --resume re-run this epoch
                 step_ckpt = _full_state(
                     policy, optimizer, ema, epoch, global_step, best_val_loss, epoch_complete=False
                 )
                 torch.save(step_ckpt, step_path)
-                _prune_ckpts(self.ckpt_dir, "checkpoint_step*.pt", max_keep_ckpts)
+                _prune_ckpts(self.output_dir, "checkpoint_step*.pt", max_keep_ckpts)
 
         return epoch_losses, global_step
 
@@ -365,7 +379,7 @@ class TrainWorkspace:
         if not train_history:
             return
         for key in train_history[0]:
-            plot_path = os.path.join(self.ckpt_dir, f"train_val_{key}.png")
+            plot_path = os.path.join(self.output_dir, f"train_val_{key}.png")
             train_values = [d[key].item() for d in train_history]
             val_values = [d[key].item() for d in validation_history]
             train_x = np.linspace(0, current_epoch, len(train_values))

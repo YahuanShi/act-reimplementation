@@ -4,8 +4,8 @@ Step 10.2 — End-to-end integration test.
 Validates the complete ACT pipeline from training to inference:
 1. Create synthetic dataset and fit normalizer
 2. Train a policy for a few epochs using TrainWorkspace
-3. Save checkpoint and normalizer stats
-4. Load the trained checkpoint using eval.py's load_policy()
+3. Save self-contained checkpoints (weights + config + normalizer stats)
+4. Load the trained checkpoint using act/policy/loader.py
 5. Run inference through the full InferencePipeline
 6. Verify the loaded model produces identical actions to the original
 7. Test both ensembled and non-ensembled inference modes
@@ -16,7 +16,6 @@ checkpointing, loading, and inference) works together correctly.
 """
 
 import os
-import pickle
 import tempfile
 
 import torch
@@ -24,7 +23,8 @@ from torch.utils.data import DataLoader, Dataset
 
 from act.dataset.normalizer import ACTNormalizer
 from act.policy.act_policy import ACTPolicy
-from inference.temporal_ensemble import InferencePipeline
+from act.policy.loader import load_checkpoint
+from act.policy.temporal_ensemble import InferencePipeline
 from training.workspace import TrainWorkspace
 
 
@@ -94,9 +94,9 @@ def test_train_and_save():
         "kl_weight": 10.0,
         "num_epochs": 3,
         "batch_size": 4,
-        "ckpt_dir": tmpdir,
+        "output_dir": tmpdir,
         "seed": 42,
-        "save_every": 2,
+        "save_every_epochs": 2,
     }
 
     train_ds = SyntheticDataset(num_samples=16, chunk_size=20, seed=42)
@@ -113,9 +113,8 @@ def test_train_and_save():
     print(f"  Best epoch: {best_epoch}, loss: {best_loss:.4f}")
 
     # Verify all expected files exist
-    assert os.path.exists(os.path.join(tmpdir, "policy_best.ckpt"))
-    assert os.path.exists(os.path.join(tmpdir, "policy_last.ckpt"))
-    assert os.path.exists(os.path.join(tmpdir, "dataset_stats.pkl"))
+    assert os.path.exists(os.path.join(tmpdir, "policy_best.pt"))
+    assert os.path.exists(os.path.join(tmpdir, "policy_final.pt"))
     print("  All checkpoint files saved successfully")
     print("  PASSED\n")
 
@@ -123,23 +122,18 @@ def test_train_and_save():
 
 
 def test_load_and_infer(tmpdir, config):
-    """Test 2: Load checkpoint and run inference, matching eval.py's logic."""
+    """Test 2: Load checkpoint and run inference, matching act/policy/loader.py."""
     print("=" * 60)
     print("Test 2: Load Checkpoint and Infer")
     print("=" * 60)
 
-    ckpt_path = os.path.join(tmpdir, "policy_best.ckpt")
-    stats_path = os.path.join(tmpdir, "dataset_stats.pkl")
+    ckpt_path = os.path.join(tmpdir, "policy_best.pt")
 
-    # Load normalizer from saved stats
-    with open(stats_path, "rb") as f:
-        stats = pickle.load(f)
-    normalizer = ACTNormalizer()
-    normalizer.load_state_dict(stats)
-    print("  Normalizer loaded from stats file")
+    # The checkpoint is self-contained: weights + config + normalizer stats
+    state_dict, _, normalizer = load_checkpoint(ckpt_path)
+    print("  Normalizer loaded from checkpoint")
 
     # Load policy from checkpoint
-    state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=True)
     policy = ACTPolicy(config)
     policy.load_state_dict(state_dict)
     policy.eval()
@@ -236,10 +230,9 @@ def test_config_inference_from_checkpoint(tmpdir, original_config):
     print("Test 4: Config Inference from Checkpoint")
     print("=" * 60)
 
-    ckpt_path = os.path.join(tmpdir, "policy_best.ckpt")
-    state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+    state_dict, _, _ = load_checkpoint(os.path.join(tmpdir, "policy_best.pt"))
 
-    # Infer key dimensions from state_dict (matching eval.py logic)
+    # Infer key dimensions from state_dict (matching loader.infer_config_from_state_dict)
     query_embed = state_dict["model.query_embed.weight"]
     num_queries = query_embed.shape[0]
     hidden_dim = query_embed.shape[1]
@@ -296,15 +289,8 @@ def test_normalizer_roundtrip(tmpdir):
     print("Test 5: Normalizer Save/Load Roundtrip")
     print("=" * 60)
 
-    stats_path = os.path.join(tmpdir, "dataset_stats.pkl")
-
-    # Load saved stats
-    with open(stats_path, "rb") as f:
-        stats = pickle.load(f)
-
-    # Create normalizer from stats
-    normalizer = ACTNormalizer()
-    normalizer.load_state_dict(stats)
+    # Normalizer stats stored inside the inference checkpoint
+    _, _, normalizer = load_checkpoint(os.path.join(tmpdir, "policy_final.pt"))
 
     # Normalize → denormalize roundtrip
     raw_action = torch.randn(1, 7)
@@ -321,18 +307,17 @@ def test_normalizer_roundtrip(tmpdir):
     print(f"  Qpos roundtrip error:   {error_q:.2e}")
     assert error_q < 1e-5, f"Roundtrip error too large: {error_q}"
 
-    # Verify stats are numerically identical after save/load
-    original_normalizer = ACTNormalizer()
-    original_normalizer.load_state_dict(stats)
+    # Both inference checkpoints must carry identical normalizer stats
+    _, _, best_normalizer = load_checkpoint(os.path.join(tmpdir, "policy_best.pt"))
     state1 = normalizer.state_dict()
-    state2 = original_normalizer.state_dict()
+    state2 = best_normalizer.state_dict()
     for key in state1:
         v1, v2 = state1[key], state2[key]
         if isinstance(v1, torch.Tensor):
             assert torch.allclose(v1, v2), f"Mismatch in {key}"
         else:
             assert v1 == v2, f"Mismatch in {key}"
-    print("  Stats identical after save/load: OK")
+    print("  Stats identical in policy_best.pt and policy_final.pt: OK")
     print("  PASSED\n")
 
 

@@ -20,6 +20,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from act.dataset.normalizer import ACTNormalizer
 from act.policy.act_policy import ACTPolicy
+from act.policy.loader import load_checkpoint
 from training.workspace import TrainWorkspace
 
 
@@ -79,9 +80,9 @@ def test_training_smoke():
             "kl_weight": 10.0,
             "num_epochs": 5,
             "batch_size": 4,
-            "ckpt_dir": tmpdir,
+            "output_dir": tmpdir,
             "seed": 42,
-            "save_every": 2,
+            "save_every_epochs": 2,
         }
 
         # Create synthetic data
@@ -104,16 +105,14 @@ def test_training_smoke():
         assert best_loss < float("inf"), "Should have found a best checkpoint"
 
         # Verify files were saved
-        assert os.path.exists(os.path.join(tmpdir, "policy_best.ckpt"))
-        assert os.path.exists(os.path.join(tmpdir, "policy_last.ckpt"))
-        assert os.path.exists(os.path.join(tmpdir, "dataset_stats.pkl"))
+        assert os.path.exists(os.path.join(tmpdir, "policy_best.pt"))
+        assert os.path.exists(os.path.join(tmpdir, "policy_final.pt"))
         print("  Checkpoint files: OK")
 
         # Verify checkpoint loads correctly
+        state_dict, _, _ = load_checkpoint(os.path.join(tmpdir, "policy_best.pt"))
         policy = ACTPolicy(config)
-        policy.load_state_dict(
-            torch.load(os.path.join(tmpdir, "policy_best.ckpt"), weights_only=True)
-        )
+        policy.load_state_dict(state_dict)
         print("  Checkpoint loading: OK")
 
         # Verify inference works with loaded checkpoint

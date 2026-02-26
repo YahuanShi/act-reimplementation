@@ -4,13 +4,15 @@ Integration tests — full pipeline: train → save → load → infer.
 Run: pytest tests/ -v
 
 Covers:
-  - TrainWorkspace produces valid checkpoint and normalizer files
+  - TrainWorkspace produces self-contained inference checkpoints (weights + config + stats)
   - Checkpoint can be reloaded and produces identical inference outputs
-  - Config can be inferred from state_dict tensor shapes (eval.py flow)
+  - Config can be inferred from state_dict tensor shapes (fallback for old checkpoints)
   - checkpoint_full.pt is written periodically; step checkpoints resume correctly
-  - EvalRunner + MockEnv completes n_test episodes without errors
+  - max_steps caps training mid-epoch; legacy checkpoint directories still load
+  - EvalRunner + MockEnv completes n_episodes episodes without errors
 """
 
+import json
 import os
 import pickle
 import tempfile
@@ -20,6 +22,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from act.dataset.normalizer import ACTNormalizer
 from act.policy.act_policy import ACTPolicy
+from act.policy.loader import infer_config_from_state_dict, load_checkpoint
 from evaluation.runner import EvalRunner, MockEnv
 from training.workspace import TrainWorkspace
 
@@ -61,9 +64,9 @@ def _base_config(tmpdir, epochs=3):
         "kl_weight": 10.0,
         "num_epochs": epochs,
         "batch_size": 4,
-        "ckpt_dir": tmpdir,
+        "output_dir": tmpdir,
         "seed": 42,
-        "save_every": 2,
+        "save_every_epochs": 2,
     }
 
 
@@ -81,10 +84,14 @@ def test_training_produces_checkpoints():
         workspace = TrainWorkspace(config)
         best_epoch, best_loss, _ = workspace.run(train_loader, val_loader, normalizer)
 
-        assert os.path.exists(os.path.join(tmpdir, "policy_best.ckpt"))
-        assert os.path.exists(os.path.join(tmpdir, "policy_last.ckpt"))
-        assert os.path.exists(os.path.join(tmpdir, "dataset_stats.pkl"))
+        assert os.path.exists(os.path.join(tmpdir, "policy_best.pt"))
+        assert os.path.exists(os.path.join(tmpdir, "policy_final.pt"))
         assert best_loss < float("inf")
+        # Inference checkpoints are self-contained: weights + config + normalizer
+        state_dict, cfg, _ = load_checkpoint(os.path.join(tmpdir, "policy_best.pt"))
+        assert (
+            cfg["num_queries"] == config["num_queries"] and "model.query_embed.weight" in state_dict
+        )
 
 
 def test_checkpoint_reload_deterministic():
@@ -102,11 +109,7 @@ def test_checkpoint_reload_deterministic():
             normalizer,
         )
 
-        state_dict = torch.load(
-            os.path.join(tmpdir, "policy_best.ckpt"),
-            map_location="cpu",
-            weights_only=True,
-        )
+        state_dict, _, _ = load_checkpoint(tmpdir)  # directory → policy_best.pt
         policy = ACTPolicy(config)
         policy.load_state_dict(state_dict)
         policy.eval()
@@ -136,30 +139,12 @@ def test_config_inferred_from_state_dict():
             normalizer,
         )
 
-        sd = torch.load(
-            os.path.join(tmpdir, "policy_best.ckpt"),
-            map_location="cpu",
-            weights_only=True,
-        )
-
-        # Replicate eval.py's config inference logic
-        num_queries = sd["model.query_embed.weight"].shape[0]
-        hidden_dim = sd["model.query_embed.weight"].shape[1]
-        action_dim = sd["model.action_head.weight"].shape[0]
-        state_dim = sd["model.encoder_joint_proj.weight"].shape[1]
-        enc_layers = sum(
-            1 for k in sd if "transformer.encoder.layers" in k and "self_attn.in_proj_weight" in k
-        )
-        dec_layers = sum(
-            1 for k in sd if "transformer.decoder.layers" in k and "self_attn.in_proj_weight" in k
-        )
-
-        assert num_queries == config["num_queries"]
-        assert hidden_dim == config["hidden_dim"]
-        assert action_dim == config["action_dim"]
-        assert state_dim == config["state_dim"]
-        assert enc_layers == config["enc_layers"]
-        assert dec_layers == config["dec_layers"]
+        sd, _, _ = load_checkpoint(os.path.join(tmpdir, "policy_best.pt"))
+        inferred = infer_config_from_state_dict(sd)
+        for key in ("num_queries", "hidden_dim", "action_dim", "state_dim"):
+            assert inferred[key] == config[key], key
+        assert inferred["enc_layers"] == config["enc_layers"]
+        assert inferred["dec_layers"] == config["dec_layers"]
 
 
 def test_normalizer_stats_roundtrip():
@@ -174,10 +159,7 @@ def test_normalizer_stats_roundtrip():
             normalizer,
         )
 
-        with open(os.path.join(tmpdir, "dataset_stats.pkl"), "rb") as f:
-            stats = pickle.load(f)
-        loaded = ACTNormalizer()
-        loaded.load_state_dict(stats)
+        _, _, loaded = load_checkpoint(os.path.join(tmpdir, "policy_final.pt"))
 
         sample = torch.randn(1, 7)
         assert torch.allclose(
@@ -190,7 +172,7 @@ def test_normalizer_stats_roundtrip():
 def test_periodic_full_checkpoint_and_step_resume():
     with tempfile.TemporaryDirectory() as tmpdir:
         config = _base_config(tmpdir, epochs=3)
-        config.update(save_every=1, save_every_steps=2, max_keep_ckpts=2)
+        config.update(save_every_epochs=1, save_every_steps=2, max_keep_checkpoints=2)
         normalizer = ACTNormalizer()
         normalizer.fit_from_tensors(torch.randn(100, 7), torch.randn(100, 7))
         train_loader = DataLoader(_SyntheticDataset(n=16), batch_size=4)  # 4 steps/epoch
@@ -247,10 +229,46 @@ def test_eval_runner_mock_env():
         normalizer=normalizer,
         chunk_size=10,
         temporal_agg=False,
-        n_test=3,
+        n_episodes=3,
         max_steps=20,
     )
     metrics = runner.run()
     assert metrics["n_episodes"] == 3
     assert "mean_reward" in metrics
     assert "success_rate" in metrics
+
+
+def test_max_steps_overrides_epochs():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config = _base_config(tmpdir, epochs=100)
+        config.update(max_steps=6, save_every_steps=1, max_keep_checkpoints=0)
+        normalizer = ACTNormalizer()
+        normalizer.fit_from_tensors(torch.randn(100, 7), torch.randn(100, 7))
+        TrainWorkspace(config).run(
+            DataLoader(_SyntheticDataset(n=16), batch_size=4),  # 4 steps/epoch
+            DataLoader(_SyntheticDataset(n=8, seed=1), batch_size=4),
+            normalizer,
+        )
+        # 6 steps = 1.5 epochs: exactly 6 step checkpoints, none beyond max_steps
+        steps = sorted(int(f[15:-3]) for f in os.listdir(tmpdir) if f.startswith("checkpoint_step"))
+        assert steps == [1, 2, 3, 4, 5, 6]
+
+
+def test_legacy_checkpoint_directory_loads():
+    """Checkpoints from before the self-contained format: bare state_dict + side files."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config = _base_config(tmpdir)
+        normalizer = ACTNormalizer()
+        normalizer.fit_from_tensors(torch.randn(100, 7), torch.randn(100, 7))
+        policy = ACTPolicy(config)
+        torch.save(policy.state_dict(), os.path.join(tmpdir, "policy_best.ckpt"))
+        with open(os.path.join(tmpdir, "dataset_stats.pkl"), "wb") as f:
+            pickle.dump(normalizer.state_dict(), f)
+        with open(os.path.join(tmpdir, "config.json"), "w") as f:
+            json.dump(config, f)
+
+        state_dict, cfg, loaded = load_checkpoint(tmpdir)
+        assert cfg["hidden_dim"] == config["hidden_dim"]
+        assert state_dict.keys() == policy.state_dict().keys()
+        sample = torch.randn(1, 7)
+        assert torch.allclose(normalizer.normalize_action(sample), loaded.normalize_action(sample))

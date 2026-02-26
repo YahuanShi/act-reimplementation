@@ -197,7 +197,7 @@ class Joiner(nn.Sequential):
         xs = self[0](tensor)  # backbone forward
         out = []
         pos = []
-        for name, x in xs.items():
+        for x in xs.values():
             out.append(x)
             # Compute 2D position encoding matching this feature map's spatial dims
             pos.append(self[1](x).to(x.dtype))

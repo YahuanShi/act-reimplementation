@@ -11,6 +11,7 @@ robot_sim observations use LeRobot names, which are also what ACT trained on:
 Cameras are stacked in config["camera_names"] order, as during training.
 
 Chunked execution vs temporal ensembling is handled by InferencePipeline unchanged.
+Used by eval.py --sim lift|can (same file name and role as in the DP repo).
 
 Requires: uv pip install --python .venv/bin/python -e ../robot-sim "opencv-python<5"
 """
@@ -40,34 +41,3 @@ class ACTSimPolicy:
         action = self.pipeline.get_action(self.t, qpos, image)
         self.t += 1
         return action.numpy()
-
-
-def evaluate_franka(
-    pipeline,
-    config,
-    task,
-    n_episodes,
-    start_seed,
-    image_size,
-    video_dir,
-    output_json,
-    max_steps,
-    n_videos=5,
-):
-    from robot_sim.evaluate import evaluate
-
-    action_space = {10: "abs", 7: "delta"}.get(config["action_dim"])
-    if action_space is None:
-        raise SystemExit(f"action_dim {config['action_dim']} matches no robot_sim action space")
-    return evaluate(
-        ACTSimPolicy(pipeline, config["camera_names"]),
-        task=task,
-        n_episodes=n_episodes,
-        start_seed=start_seed,
-        image_size=image_size,
-        action_space=action_space,
-        max_steps=max_steps,
-        video_dir=video_dir,
-        n_videos=n_videos,
-        output_json=output_json,
-    )

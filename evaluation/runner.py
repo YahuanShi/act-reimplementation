@@ -15,7 +15,7 @@ future actions, which are then executed sequentially. Two modes are supported:
        - Execute only the ensembled action at the current step
 
 Both modes share the same interface: call runner.run(policy) and it returns
-per-episode metrics aggregated over n_test rollouts.
+per-episode metrics aggregated over n_episodes rollouts.
 
 Environments must follow the gymnasium interface, with dict observations
 already converted to ACT's input format (see evaluation/aloha_env.py):
@@ -31,7 +31,7 @@ Optionally, env.render() returning an (H, W, 3) uint8 frame enables videos.
 import numpy as np
 import torch
 
-from inference.temporal_ensemble import InferencePipeline
+from act.policy.temporal_ensemble import InferencePipeline
 
 
 def run_episode(env, pipeline, max_steps=400, seed=None, record=False):
@@ -90,7 +90,7 @@ class EvalRunner:
     Multi-episode evaluation runner for ACT policies.
 
     One env and one pipeline are built and reused; each episode resets both,
-    and episode i is reset with seed + i so results are reproducible.
+    and episode i is reset with start_seed + i so results are reproducible.
 
     Args:
         env_factory: callable that returns a fresh environment instance
@@ -99,11 +99,11 @@ class EvalRunner:
         chunk_size: action chunk length (num_queries)
         temporal_agg: whether to use temporal ensembling
         k: temporal ensemble decay constant
-        n_test: number of rollout episodes
+        n_episodes: number of rollout episodes
         max_steps: maximum steps per episode
         device: torch device for inference
-        seed: base reset seed
-        num_videos: record frames for the first num_videos episodes
+        start_seed: episode i is reset with start_seed + i
+        n_videos: record frames for the first n_videos episodes
     """
 
     def __init__(
@@ -114,11 +114,11 @@ class EvalRunner:
         chunk_size,
         temporal_agg=False,
         k=0.01,
-        n_test=50,
+        n_episodes=50,
         max_steps=400,
         device="cpu",
-        seed=0,
-        num_videos=0,
+        start_seed=0,
+        n_videos=0,
     ):
         self.env_factory = env_factory
         self.policy = policy
@@ -126,15 +126,15 @@ class EvalRunner:
         self.chunk_size = chunk_size
         self.temporal_agg = temporal_agg
         self.k = k
-        self.n_test = n_test
+        self.n_episodes = n_episodes
         self.max_steps = max_steps
         self.device = device
-        self.seed = seed
-        self.num_videos = num_videos
+        self.start_seed = start_seed
+        self.n_videos = n_videos
 
     def run(self):
         """
-        Run n_test episodes and aggregate metrics.
+        Run n_episodes episodes and aggregate metrics.
 
         Returns:
             dict with success rate, reward stats, episode count and per-episode
@@ -151,18 +151,18 @@ class EvalRunner:
             device=self.device,
         )
         results = []
-        for ep_idx in range(self.n_test):
+        for ep_idx in range(self.n_episodes):
             result = run_episode(
                 env,
                 pipeline,
                 max_steps=self.max_steps,
-                seed=self.seed + ep_idx,
-                record=ep_idx < self.num_videos,
+                seed=self.start_seed + ep_idx,
+                record=ep_idx < self.n_videos,
             )
             results.append(result)
             n_success = sum(r["success"] for r in results)
             print(
-                f"  Episode {ep_idx + 1:3d}/{self.n_test}: "
+                f"  Episode {ep_idx + 1:3d}/{self.n_episodes}: "
                 f"success={result['success']!s:5}  "
                 f"max_reward={result['max_reward']:.1f}  "
                 f"steps={result['steps']}  "

@@ -78,7 +78,7 @@ def test_state_dict_roundtrip():
 
 def test_not_fitted_raises():
     normalizer = ACTNormalizer()
-    with pytest.raises(Exception):
+    with pytest.raises(AssertionError):
         normalizer.normalize_action(torch.randn(5, 7))
 
 

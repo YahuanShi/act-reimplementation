@@ -15,7 +15,7 @@ import torch
 
 from act.dataset.normalizer import ACTNormalizer
 from act.policy.act_policy import ACTPolicy
-from inference.temporal_ensemble import InferencePipeline, TemporalEnsemble
+from act.policy.temporal_ensemble import InferencePipeline, TemporalEnsemble
 
 
 def make_pipeline(temporal_agg=False, chunk_size=10, state_dim=7, action_dim=7):
@@ -148,5 +148,5 @@ def test_pipeline_reset_is_idempotent():
         pipeline.get_action(t, torch.randn(7), torch.rand(1, 3, 120, 160)) for t in range(5)
     ]
 
-    for a, b in zip(actions_first, actions_second):
+    for a, b in zip(actions_first, actions_second, strict=True):
         assert torch.allclose(a, b), "same seed after reset must produce identical actions"
