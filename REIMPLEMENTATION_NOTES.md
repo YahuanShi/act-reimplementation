@@ -67,6 +67,10 @@ On the Franka sim, `--crop_ratio 0.9` was used for both tasks.
   legitimately zero action (e.g. a joint at 0 rad, a closed gripper) was dropped from the
   average. Track populated rows with a separate boolean mask.
 - On robomimic Can, temporal ensembling improved success from 80% to 88% (chunk 20).
+- **Chunk size matters more than the execution mode.** Can, chunk 10 / 20 / 50:
+  chunked 74% / 80% / 38%, ensembling 74% / 88% / 64%. A 50-step chunk runs 2.5 s open
+  loop and cannot react to a slipping grasp; ensembling re-queries every step and
+  recovers most of the loss.
 
 ---
 
@@ -132,14 +136,18 @@ The real-robot loop (`inference.py`) shares its conventions and helpers with the
 Shared Franka simulation (`../robot-sim`: robosuite + robomimic proficient-human demos),
 50 episodes per entry, seeds 100000–100049, same seeds as the DP repo:
 
-| Policy | Lift | Can |
-|---|---|---|
-| Diffusion Policy (30k steps) | 100% | 96% |
-| ACT chunked (chunk 20, 60 epochs) | 100% | 80% |
-| ACT temporal ensembling | 100% | 88% |
+| Policy | Lift | Can | Square |
+|---|---|---|---|
+| Diffusion Policy (30k steps) | 100% | 96% | 70% |
+| ACT chunked (chunk 20, 60 epochs) | 100% | 80% | 66% |
+| ACT temporal ensembling | 100% | 88% | 70% |
 
 Both methods with their papers' default hyperparameters; see the robot-sim README for
 intervals and analysis.
+
+ALOHA TransferCube (scripted demos, chunk 100, 20 epochs, seeds 1000–1049): 96% chunked,
+94% temporal ensembling — the paper reports ~90%, so the reimplementation reproduces the
+original task.
 
 ---
 

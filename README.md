@@ -16,8 +16,9 @@ closed loop from 84×84 camera images. Real-robot demo pending (no real-robot da
 
 - [ ] **Training** — Train on the UR5 pick-and-place dataset (no real-robot data yet)
 - [ ] **Demo** — Add demo GIF / video of real robot pick-and-place deployment (simulation demo above)
-- [ ] **Sim results (ALOHA)** — Train on ALOHA TransferCube and report success rate (paper: ~90% scripted, ~50% human data)
-- [x] **Franka sim results** — ACT vs Diffusion Policy on robomimic Lift / Can in the shared [`robot-sim`](../robot-sim) environment (same seeds)
+- [x] **Sim results (ALOHA)** — TransferCube, scripted demos: 96% chunked / 94% temporal ensembling (paper: ~90%), see [Simulation (ALOHA)](#simulation-aloha)
+- [ ] **Sim results (ALOHA, human demos)** — TransferCube trained on `aloha_sim_transfer_cube_human` (paper: ~50%)
+- [x] **Franka sim results** — ACT vs Diffusion Policy on robomimic Lift / Can / Square in the shared [`robot-sim`](../robot-sim) environment (same seeds), plus a chunk-size sweep
 - [ ] **Real-robot success rate** — run N trials with `inference.py --num_episodes N --record_dir` and fill in [Results](#results) with `scripts/summarize_trials.py`
 
 ---
@@ -443,16 +444,28 @@ python eval.py --checkpoint outputs/sim_lift --sim lift --n_episodes 50 --tempor
 Results (50 episodes, seeds 100000–100049, 95% Wilson interval, `policy_best`), same
 seeds as the Diffusion Policy reimplementation:
 
-| Policy | Training | Lift | Can |
-|---|---|---|---|
-| Diffusion Policy (U-Net) | 30k steps | **50/50 = 100%** (93–100%) | **48/50 = 96%** (87–99%) |
-| ACT, chunked execution | 60 epochs | 50/50 = 100% (93–100%) | 40/50 = 80% (67–89%) |
-| ACT, temporal ensembling | 60 epochs | 50/50 = 100% (93–100%) | 44/50 = 88% (76–94%) |
+| Policy | Training | Lift | Can | Square |
+|---|---|---|---|---|
+| Diffusion Policy (U-Net) | 30k steps | **50/50 = 100%** (93–100%) | **48/50 = 96%** (87–99%) | 35/50 = 70% (56–81%) |
+| ACT, chunked execution | 60 epochs | 50/50 = 100% (93–100%) | 40/50 = 80% (67–89%) | 33/50 = 66% (52–78%) |
+| ACT, temporal ensembling | 60 epochs | 50/50 = 100% (93–100%) | 44/50 = 88% (76–94%) | 35/50 = 70% (56–81%) |
 
 Temporal ensembling improves Can from 80% to 88%; most of its failures are seeds that
 chunked execution also fails. Diffusion Policy is ahead on Can (clearly against chunked
-execution, within noise against temporal ensembling). ACT runs with the paper defaults
-(chunk 20, kl_weight 10), not tuned for robomimic. Details in the
+execution, within noise against temporal ensembling); on Square all three are tied at
+66–70%. ACT runs with the paper defaults (chunk 20, kl_weight 10), not tuned for robomimic.
+
+Chunk-size sweep on Can (same recipe, only `--chunk_size` changed):
+
+| Chunk size | Chunked execution | Temporal ensembling |
+|---|---|---|
+| 10 | 37/50 = 74% (60–84%) | 37/50 = 74% (60–84%) |
+| **20** | **40/50 = 80%** (67–89%) | **44/50 = 88%** (76–94%) |
+| 50 | 19/50 = 38% (26–52%) | 32/50 = 64% (50–76%) |
+
+Too long a chunk removes closed-loop feedback (chunk 50 = 2.5 s open loop at 20 Hz):
+chunked success halves, and temporal ensembling, which re-queries every step, recovers
+most of it. Details in the
 [robot-sim README](../robot-sim#results-closed-loop-8484-images-absolute-actions).
 
 `robot-sim` is not a declared dependency (CI has no `../robot-sim` checkout): the sim
@@ -472,6 +485,19 @@ python eval.py --checkpoint outputs/insertion --sim aloha_insertion   # train on
 An episode is a success when the env reports `info["is_success"]` (TransferCube:
 reward 4 — cube held by the left gripper, off the table). Episode `i` resets with
 `--start_seed + i` (default 1000). Without EGL, set `MUJOCO_GL=osmesa`.
+
+Results on TransferCube, trained on the 50 scripted demos with the command from
+[Training](#training) (`--chunk_size 100 --epochs 20 --batch_size 8`, `policy_best`),
+50 episodes, seeds 1000–1049, 95% Wilson interval:
+
+| Execution | Success | Paper (scripted data) |
+|---|---|---|
+| Chunked (chunk 100) | **48/50 = 96%** (87–99%) | — |
+| Temporal ensembling | 47/50 = 94% (84–98%) | ~90% |
+
+The reimplementation matches the paper on the original ACT task. Temporal ensembling
+gives no gain here: scripted demos are smooth and deterministic, so there is little
+jitter between overlapping chunks to average out.
 
 ### Real Robot Inference (UR + Weiss CRG + RealSense)
 
@@ -565,7 +591,8 @@ Real robot:
 |---|---|---|---|---|
 | — | — | — | — | — |
 
-Simulation: see [Simulation (Franka Panda)](#simulation-franka-panda).
+Simulation: see [Simulation (Franka Panda)](#simulation-franka-panda) and
+[Simulation (ALOHA)](#simulation-aloha).
 
 ---
 
