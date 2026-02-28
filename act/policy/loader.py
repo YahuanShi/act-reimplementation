@@ -119,11 +119,13 @@ def infer_config_from_state_dict(state_dict):
     # action_dim from action_head: (action_dim, hidden_dim)
     action_dim = state_dict["model.action_head.weight"].shape[0]
 
-    # state_dim from encoder_joint_proj: (hidden_dim, state_dim)
-    state_dim = state_dict["model.encoder_joint_proj.weight"].shape[1]
+    # state_dim from the proprioception projection: (hidden_dim, state_dim)
+    state_dim = state_dict["model.input_proj_robot_state.weight"].shape[1]
 
-    # latent_dim from latent_proj: (latent_dim*2, hidden_dim)
-    latent_dim = state_dict["model.latent_proj.weight"].shape[0] // 2
+    # latent_dim from latent_out_proj: (hidden_dim, latent_dim); no CVAE encoder
+    # weights means the model was trained with --no_cvae
+    latent_dim = state_dict["model.latent_out_proj.weight"].shape[1]
+    use_cvae = "model.latent_proj.weight" in state_dict
 
     enc_layers = sum(
         1
@@ -161,4 +163,5 @@ def infer_config_from_state_dict(state_dict):
         "camera_names": camera_names,
         "lr": 1e-5,
         "kl_weight": 10.0,
+        "use_cvae": use_cvae,
     }

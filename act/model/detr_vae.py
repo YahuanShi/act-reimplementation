@@ -11,6 +11,10 @@ This module combines three key components into a single model:
    At inference time, the encoder is not used. Instead, z is set to
    zeros (the mean of the prior distribution N(0, I)).
 
+   With use_cvae=False (ablation, paper Sec. V) the encoder is not built at all
+   and z = 0 during training too: the model becomes a plain deterministic
+   transformer trained with L1 only.
+
 2. **Visual Backbone** (ResNet18):
    Extracts features from camera images. Multiple cameras are supported
    by concatenating their feature maps along the width dimension.
@@ -102,8 +106,10 @@ class DETRVAE(nn.Module):
         num_queries,
         camera_names,
         latent_dim=32,
+        use_cvae=True,
     ):
         super().__init__()
+        self.use_cvae = use_cvae
         self.num_queries = num_queries
         self.camera_names = camera_names
         self.transformer = transformer
@@ -140,7 +146,20 @@ class DETRVAE(nn.Module):
 
         # ── CVAE encoder components ──
         self.latent_dim = latent_dim
+        if use_cvae:
+            self._build_cvae_encoder_heads(hidden_dim, state_dim, action_dim, num_queries)
 
+        # ── Decoder extra components ──
+        # Project the latent sample back to hidden_dim for the decoder. Kept without
+        # the CVAE too (z = 0 → only its bias), so both variants share the decoder.
+        self.latent_out_proj = nn.Linear(latent_dim, hidden_dim)
+
+        # Learned position embeddings for the two extra tokens prepended to
+        # the decoder input: [latent_token, proprio_token]
+        self.additional_pos_embed = nn.Embedding(2, hidden_dim)
+
+    def _build_cvae_encoder_heads(self, hidden_dim, state_dim, action_dim, num_queries):
+        latent_dim = self.latent_dim
         # CLS token: a learnable embedding prepended to the encoder input.
         # Its output representation is used to predict mu and logvar.
         self.cls_embed = nn.Embedding(1, hidden_dim)
@@ -159,14 +178,6 @@ class DETRVAE(nn.Module):
             "pos_table", get_sinusoid_encoding_table(1 + 1 + num_queries, hidden_dim)
         )
 
-        # ── Decoder extra components ──
-        # Project the latent sample back to hidden_dim for the decoder
-        self.latent_out_proj = nn.Linear(latent_dim, hidden_dim)
-
-        # Learned position embeddings for the two extra tokens prepended to
-        # the decoder input: [latent_token, proprio_token]
-        self.additional_pos_embed = nn.Embedding(2, hidden_dim)
-
     def forward(self, qpos, image, env_state, actions=None, is_pad=None):
         """
         Forward pass through the full DETRVAE model.
@@ -183,7 +194,8 @@ class DETRVAE(nn.Module):
             is_pad_hat: (bs, num_queries, 1) predicted padding (not used in loss)
             [mu, logvar]: latent distribution parameters (None at inference)
         """
-        is_training = actions is not None
+        # Without the CVAE, training takes the z = 0 path as well
+        is_training = actions is not None and self.use_cvae
         bs, _ = qpos.shape
 
         # ════════════════════════════════════════════════════════════════
@@ -384,6 +396,7 @@ def build_act_model(config):
     latent_dim = config.get("latent_dim", 32)
     dropout = config.get("dropout", 0.1)
     pre_norm = config.get("pre_norm", False)
+    use_cvae = config.get("use_cvae", True)  # absent in configs saved before the flag
 
     # Build visual backbone
     backbones = []
@@ -403,7 +416,11 @@ def build_act_model(config):
     )
 
     # Build CVAE encoder
-    encoder = build_encoder(hidden_dim, dropout, nhead, dim_feedforward, enc_layers, pre_norm)
+    encoder = (
+        build_encoder(hidden_dim, dropout, nhead, dim_feedforward, enc_layers, pre_norm)
+        if use_cvae
+        else None
+    )
 
     model = DETRVAE(
         backbones,
@@ -414,6 +431,7 @@ def build_act_model(config):
         num_queries=num_queries,
         camera_names=camera_names,
         latent_dim=latent_dim,
+        use_cvae=use_cvae,
     )
 
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)

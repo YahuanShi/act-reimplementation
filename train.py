@@ -149,6 +149,7 @@ def train(args):
         "num_queries": args.chunk_size,
         "camera_names": dataset.image_keys,
         "kl_weight": args.kl_weight,
+        "use_cvae": not args.no_cvae,
         # Augmentation (random crop + color jitter in train, center crop in eval)
         "crop_ratio": args.crop_ratio,
         "color_jitter": args.color_jitter,
@@ -235,6 +236,11 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--lr_backbone", type=float, default=1e-5)
     parser.add_argument("--kl_weight", type=float, default=10.0)
+    parser.add_argument(
+        "--no_cvae",
+        action="store_true",
+        help="Ablation: drop the CVAE encoder (z = 0 in training too, L1 loss only)",
+    )
     parser.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping max norm")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num_workers", type=int, default=4)

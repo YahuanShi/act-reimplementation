@@ -117,13 +117,17 @@ class ACTPolicy(nn.Module):
         # Expand is_pad from (bs, chunk_size) to (bs, chunk_size, 1) for broadcasting
         l1 = (all_l1 * ~is_pad.unsqueeze(-1)).mean()
 
-        # KL divergence between posterior and prior
-        total_kld, dim_wise_kld, mean_kld = kl_divergence(mu, logvar)
+        # KL divergence between posterior and prior (no posterior without the CVAE)
+        if mu is None:
+            kl = torch.zeros((), device=l1.device)
+        else:
+            total_kld, dim_wise_kld, mean_kld = kl_divergence(mu, logvar)
+            kl = total_kld[0]
 
         loss_dict = {
             "l1": l1,
-            "kl": total_kld[0],
-            "loss": l1 + self.kl_weight * total_kld[0],
+            "kl": kl,
+            "loss": l1 + self.kl_weight * kl,
         }
         return loss_dict
 

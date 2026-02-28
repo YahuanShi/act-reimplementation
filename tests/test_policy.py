@@ -9,6 +9,7 @@ Validates:
   - lr_backbone=0 really freezes the backbone
   - augmentation: random crop/jitter in train mode, deterministic center crop in eval
   - one gradient step decreases the loss
+  - use_cvae=False: no CVAE encoder, zero KL, training output = inference output
 """
 
 import torch
@@ -16,7 +17,7 @@ import torch
 from act.policy.act_policy import ACTPolicy
 
 
-def make_policy(state_dim=7, action_dim=7, chunk_size=20):
+def make_policy(state_dim=7, action_dim=7, chunk_size=20, **overrides):
     config = {
         "state_dim": state_dim,
         "action_dim": action_dim,
@@ -31,6 +32,7 @@ def make_policy(state_dim=7, action_dim=7, chunk_size=20):
         "camera_names": ["cam"],
         "lr": 1e-4,
         "kl_weight": 10.0,
+        **overrides,
     }
     return ACTPolicy(config)
 
@@ -166,3 +168,33 @@ def test_multi_camera():
     }
     info = policy.compute_loss(batch["qpos"], batch["image"], batch["action"], batch["is_pad"])
     assert torch.isfinite(info["loss"])
+
+
+def test_no_cvae_ablation():
+    policy = make_policy(use_cvae=False)
+    names = [n for n, _ in policy.named_parameters()]
+    assert policy.model.encoder is None
+    assert not any(
+        n.startswith(("model.encoder", "model.cls_embed", "model.latent_proj")) for n in names
+    )
+
+    batch = make_batch()
+    info = policy.compute_loss(batch["qpos"], batch["image"], batch["action"], batch["is_pad"])
+    assert info["kl"].item() == 0.0
+    assert torch.allclose(info["loss"], info["l1"])
+
+    # z = 0 in training too, so (without dropout / augmentation) the training forward
+    # pass is the inference forward pass
+    policy.eval()
+    image = policy._preprocess_images(batch["image"])
+    a_train, _, (mu, logvar) = policy.model(
+        batch["qpos"], image, None, batch["action"], batch["is_pad"]
+    )
+    assert mu is None and logvar is None
+    assert torch.allclose(a_train, policy.predict_action(batch["qpos"], batch["image"]))
+
+
+def test_cvae_default_for_old_configs():
+    """Configs saved before the flag existed rebuild the CVAE model."""
+    policy = make_policy()
+    assert policy.model.use_cvae and policy.model.encoder is not None
