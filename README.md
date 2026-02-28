@@ -6,20 +6,9 @@ A from-scratch reimplementation of [Action Chunking with Transformers (ACT)](htt
 
 ![ACT (temporal ensembling) in simulation](docs/sim_demo.gif)
 
-ACT (temporal ensembling) in the shared Franka simulation ([robot-sim](../robot-sim)): robomimic Lift and Can,
+ACT (temporal ensembling) in the shared Franka simulation ([robot-sim](https://github.com/YahuanShi/robot-sim)): robomimic Lift and Can,
 closed loop from 84×84 camera images. Real-robot demo pending (no real-robot data yet).
 
-
----
-
-## TODO
-
-- [ ] **Training** — Train on the UR5 pick-and-place dataset (no real-robot data yet)
-- [ ] **Demo** — Add demo GIF / video of real robot pick-and-place deployment (simulation demo above)
-- [x] **Sim results (ALOHA)** — TransferCube, scripted demos: 96% chunked / 94% temporal ensembling (paper: ~90%), see [Simulation (ALOHA)](#simulation-aloha)
-- [ ] **Sim results (ALOHA, human demos)** — TransferCube trained on `aloha_sim_transfer_cube_human` (paper: ~50%)
-- [x] **Franka sim results** — ACT vs Diffusion Policy on robomimic Lift / Can / Square in the shared [`robot-sim`](../robot-sim) environment (same seeds), plus a chunk-size sweep
-- [ ] **Real-robot success rate** — run N trials with `inference.py --num_episodes N --record_dir` and fill in [Results](#results) with `scripts/summarize_trials.py`
 
 ---
 
@@ -31,7 +20,7 @@ This is a **from-scratch reimplementation** of ACT, not a fork. Every line of co
 
 | Aspect | [Original (Zhao et al.)](https://github.com/tonyzhaozh/act) | This Project |
 |--------|-------------------------------------------------------------|--------------|
-| **Code origin** | Complete ALOHA framework (~5k LOC) | From-scratch rewrite (~2.5k LOC) |
+| **Code origin** | Complete ALOHA framework (~5k LOC) | From-scratch rewrite (~6k LOC + 1.4k tests) |
 | **Config system** | argparse + hardcoded constants | Plain argparse, single `train.py` |
 | **Data format** | HDF5 / RoboMimic | LeRobot v3 (modern standard) |
 | **EMA** | Not used | Buffer-aware EMA for stable inference |
@@ -231,7 +220,7 @@ Input:
 
 ## 3. Project Architecture
 
-Same layout and CLI as the [Diffusion Policy reimplementation](../diffusion-policy-reimplementation).
+Same layout and CLI as the [Diffusion Policy reimplementation](https://github.com/YahuanShi/diffusion-policy-reimplementation).
 
 ```
 .
@@ -329,6 +318,11 @@ python train.py \
     --repo_id local/ur5_pick_place --root ./data/ur5_pick_place \
     --chunk_size 50 --max_steps 30000 --batch_size 16 --output_dir outputs/ur5
 
+# CVAE ablation on human demos (drop the CVAE encoder, L1 loss only)
+python train.py --repo_id lerobot/aloha_sim_transfer_cube_human \
+    --chunk_size 100 --epochs 20 --batch_size 8 --no_cvae \
+    --output_dir outputs/aloha_transfer_cube_human_nocvae
+
 # With augmentation (random crop to 95% of H/W + color jitter; center crop at eval)
 python train.py --repo_id lerobot/aloha_sim_transfer_cube_human \
     --crop_ratio 0.95 --color_jitter
@@ -421,7 +415,7 @@ python eval.py --checkpoint outputs/ur5/policy_best.pt --mock --n_episodes 2
 ### Simulation (Franka Panda)
 
 While the real robot is unavailable, policies are trained and evaluated in the shared
-simulation repo [`../robot-sim`](../robot-sim) (robosuite Franka Panda + robomimic demos,
+simulation repo [`../robot-sim`](https://github.com/YahuanShi/robot-sim) (robosuite Franka Panda + robomimic demos,
 converted to LeRobot v3: 84×84 agentview + wrist cameras, 9-dim eef state, 10-dim absolute
 eef actions with 6D rotation, gripper 1 = open). The Diffusion Policy reimplementation uses
 the same environment and seeds, so success rates are directly comparable.
@@ -466,7 +460,7 @@ Chunk-size sweep on Can (same recipe, only `--chunk_size` changed):
 Too long a chunk removes closed-loop feedback (chunk 50 = 2.5 s open loop at 20 Hz):
 chunked success halves, and temporal ensembling, which re-queries every step, recovers
 most of it. Details in the
-[robot-sim README](../robot-sim#results-closed-loop-8484-images-absolute-actions).
+[robot-sim README](https://github.com/YahuanShi/robot-sim#results-closed-loop-8484-images-absolute-actions).
 
 `robot-sim` is not a declared dependency (CI has no `../robot-sim` checkout): the sim
 tests skip when it is not installed, and a later `uv sync` removes it again.
@@ -493,11 +487,31 @@ Results on TransferCube, trained on the 50 scripted demos with the command from
 | Execution | Success | Paper (scripted data) |
 |---|---|---|
 | Chunked (chunk 100) | **48/50 = 96%** (87–99%) | — |
-| Temporal ensembling | 47/50 = 94% (84–98%) | ~90% |
+| Temporal ensembling | 47/50 = 94% (84–98%) | 86% |
 
-The reimplementation matches the paper on the original ACT task. Temporal ensembling
+Paper: Table I of Zhao et al. (2023), final "Transfer" stage, ACT with temporal ensembling,
+3 training seeds × 50 evaluations (this repo: one training seed). The reimplementation
+reaches the paper's level on the original ACT task. Temporal ensembling
 gives no gain here: scripted demos are smooth and deterministic, so there is little
 jitter between overlapping chunks to average out.
+
+Human demos and the CVAE ablation: same command on `lerobot/aloha_sim_transfer_cube_human`
+(50 teleoperated demos), with and without `--no_cvae` (drops the CVAE encoder; z = 0 in
+training too, L1 loss only). Same seeds and interval as above:
+
+| Model | Chunked (chunk 100) | Temporal ensembling | Paper (human data) |
+|---|---|---|---|
+| ACT (CVAE) | 25/50 = 50% (37–63%) | **37/50 = 74%** (60–84%) | 50% |
+| ACT without CVAE | 28/50 = 56% (42–69%) | 33/50 = 66% (52–78%) | — |
+
+With the CVAE, the reimplementation matches or exceeds the paper's 50% on human data
+(Table I, one training seed here). Temporal ensembling helps on human demos (+24 points
+with the CVAE; the intervals barely overlap), unlike on the smooth scripted ones.
+
+The CVAE ablation does **not** reproduce the paper's effect: the paper reports 35.3% → 2%
+without the CVAE on human data, averaged over TransferCube and Insertion; here the two
+models are within noise on TransferCube alone. This run covers one task and one training
+seed (Insertion is not tested), so the cause of the difference is open.
 
 ### Real Robot Inference (UR + Weiss CRG + RealSense)
 
@@ -583,13 +597,9 @@ checkpoint loading. They run in CI (`.github/workflows/ci.yml`) together with `r
 
 ## Results
 
-<!-- Fill in from `python scripts/summarize_trials.py --record_dir trials/ --markdown trials/results.md` -->
-
-Real robot:
-
-| Checkpoint | Success | Rate | 95% CI | Mean duration |
-|---|---|---|---|---|
-| — | — | — | — | — |
+Real robot: pending — no real-robot data yet. The trial tooling is in place (see
+[Recording Trials](#recording-trials-demo--success-rate)); results will be filled in with
+`scripts/summarize_trials.py`.
 
 Simulation: see [Simulation (Franka Panda)](#simulation-franka-panda) and
 [Simulation (ALOHA)](#simulation-aloha).

@@ -146,8 +146,11 @@ Both methods with their papers' default hyperparameters; see the robot-sim READM
 intervals and analysis.
 
 ALOHA TransferCube (scripted demos, chunk 100, 20 epochs, seeds 1000–1049): 96% chunked,
-94% temporal ensembling — the paper reports ~90%, so the reimplementation reproduces the
-original task.
+94% temporal ensembling — the paper reports 86% (Table I, final transfer stage), so the
+reimplementation reproduces the original task. On the human demos: 50% chunked, 74% temporal
+ensembling (paper: 50%). Without the CVAE (`--no_cvae`): 56% / 66%, within noise of the CVAE
+model — the paper's large drop (35.3% → 2%, averaged over two tasks) does not show up on
+TransferCube with one training seed.
 
 ---
 
